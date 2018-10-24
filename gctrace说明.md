@@ -76,7 +76,7 @@ gctrace: setting gctrace=1 causes the garbage collector to emit a single line to
 	MemProfileRate for the default value.
 ```
 
-###拿个例子做说明
+### 拿个例子做说明
 
 ```
 gc 84 @1385.961s 2%: 0.20+4138+0.29 ms clock, 6.4+33879/40532/68952+9.3 ms cpu, 14799->15033->7927 MB, 15626 MB goal, 40 P
