@@ -83,9 +83,9 @@ gc 84 @1385.961s 2%: 0.20+4138+0.29 ms clock, 6.4+33879/40532/68952+9.3 ms cpu, 
 ```
 信息输出的代码位置：`runtime/mgc.go``func gcMarkTermination(nextTriggerRatio float64)`函数里。
 
-`84` 第84次进行gc操作，进程启动时的第一次gc为1
+`84` 第84次进行gc操作，是从进程启动的时候开始的。
 
-`@1385.961s` 相对进程启动后进行了1385.961秒的时间
+`@1385.961s` 相对进程启动后进行了1385.961秒的时间。
 
 `2%` (TODO 还没理解，待补充 )
 
@@ -93,8 +93,8 @@ gc 84 @1385.961s 2%: 0.20+4138+0.29 ms clock, 6.4+33879/40532/68952+9.3 ms cpu, 
 
 `6.4+33879/40532/68952+9.3 ms cpu` 5个数字分别为：`辅助mark`+`gcMarkWorkerDedicatedMode mark模式/gcMarkWorkerFractionalMode mark模式/gcMarkWorkerIdleMode mark模式`+`mark阶段总时长(参与gc的线程数*mark时长)`
 
-`14799->15033->7927 MB` (TODO)
+`14799->15033->7927 MB` 开始GC时的存活堆大小->GC(GC只包含sweep、mark两个阶段，不包含清理阶段)后的堆大小->存活的堆大小(非精确值但是接近的值)
 
-`15626 MB goal` (TODO)
+`15626 MB goal` 此轮GC目标GC的堆大小。(TODO 为什么目标比实际存活的还大？)
 
-`40 P` 40个线程参与gc
+`40 P` 40个线程参与GC
