@@ -89,12 +89,12 @@ gc 84 @1385.961s 2%: 0.20+4138+0.29 ms clock, 6.4+33879/40532/68952+9.3 ms cpu, 
 
 `2%` (TODO 还没理解，待补充 )
 
-`0.20+4138+0.29 ms clock` 分别为STW(stop-the-word)的扫描、并发标记、清理三个阶段的耗时，单位为ms。扫描阶段用4138ms，这个时间阶段是不会STW的，首先扫描阶段结束后，进入该阶段前会先start-the-word。因此真正stop-the-word的只有扫描跟清理两个阶段，也就是0.20+0.29=0.49ms。
+`0.20+4138+0.29 ms clock` 清扫上一轮GC未sweep的耗时+标记阶段耗时+本轮GC sweep耗时。mark阶段用4138ms，这个时间阶段是不会STW的，首先进入该阶段前会先start-the-word。因此真正stop-the-word的只sweep阶段，也就是两个时间0.20+0.29=0.49ms。
 
 `6.4+33879/40532/68952+9.3 ms cpu` 5个数字分别为：`辅助mark`+`gcMarkWorkerDedicatedMode mark模式/gcMarkWorkerFractionalMode mark模式/gcMarkWorkerIdleMode mark模式`+`mark阶段总时长(参与gc的线程数*mark时长)`
 
 `14799->15033->7927 MB` 开始GC时的存活堆大小->GC(GC只包含sweep、mark两个阶段，不包含清理阶段)后的堆大小->存活的堆大小(非精确值但是接近的值)
 
-`15626 MB goal` 此轮GC目标GC的堆大小。(TODO 为什么目标比实际存活的还大？)
+`15626 MB goal` 此轮GC目标GC的堆大小。
 
 `40 P` 40个线程参与GC
