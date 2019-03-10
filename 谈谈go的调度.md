@@ -16,7 +16,7 @@
 
 三者大致关系如下图：
 
-![schedule0.png](schedule0.png)
+![](images/schedule0.png)
 
 前两个图代表2个正在运行goroutine的M，第三个图代表没有goroutine运行的M。前两个图中可运行的goroutine存放到P里面，然后占用了一个CPU线程来运行。第三个图由于没有运行任务因此不占用CPU线程。
 
@@ -126,7 +126,7 @@ if procresize(procs) != nil {
 
 ## 调度工作流程
 
-![schedule.png](schedule.png)
+![](images/schedule.png)
 
 图1代表M启动的过程。在程序初始化的过程中说到在进程启动的最后一步启动了第一个M(即M0)，这个M从全局的空闲P列表里拿到一个P，然后与其绑定。而P里面有2个管理G的链表`runq`存储等待运行的G列表，`gfree`存储空闲的G列表，M启动后等待可执行的G。
 
@@ -290,7 +290,7 @@ nilctxt:
 
 这就要从M的自循环过程中如何获取G、归还G的行为分析了。在上面是拿单个M(也就是单个线程来介绍)，为符合实际场景下面拿多个M(即多个线程)的场景看下工作流程：
 
-![schedule2.png](schedule2.png)
+![](images/schedule2.png)
 
 图中可以看出有两个途径：1.P1的G太多的话会主动放到全局的G链表里，P2则从全局链表里取。2.全局列表里没有的话直接从P1里偷取(steal)。当然更多M在执行的话，同样的原理。
 
