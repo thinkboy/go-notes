@@ -9,8 +9,8 @@
 调度器设计主要围绕三个概念：G、M、P
 
 * G：代表一个goroutine，每个goroutine都有自己独立的栈存放当前的运行内存及状态
-* M: 代表内核线程(Pthread)，它本身就与一个内核线程进行绑定，用于执行G
-* P：代表一个处理器，可以认为一个`有运行任务`的P占了一个CPU线程的资源
+* M: 代表内核线程(Pthread)，它本身就与一个内核线程进行绑定，用于执行G。
+* P：代表一个处理器，可以认为一个`有运行任务`的P占了一个CPU线程的资源，只要调度的时候就有P
 
 注：`内核线程`和`CPU线程`的区别，在系统里可以有上万个内核线程，但CPU线程都很少，也就是Top命令里看到的CPU0、CPU1、CPU2......的数量。
 
@@ -122,6 +122,8 @@ if procresize(procs) != nil {
 
 ### 最后`runtime·mstart(SB)`启动调度循环
 
+这里启动的M就是第一个处理调度的M，也是m0。
+
 前面都是各种初始化操作，到这一步则开始真正的调度逻辑，下面来通过围绕G、M、P三个概念介绍Goroutine调度的运作流程。
 
 ## 调度工作流程
@@ -132,10 +134,59 @@ if procresize(procs) != nil {
 
 图2代表创建G的过程。创建一个G先扔到当前P的`runq`待运行队列里。在图3的执行过程里，M从绑定的P的`runq`列表里获取一个G来执行。当执行完成后，图4的流程里把G仍到`gfree`队列里。注意此时G并没有销毁(只重置了G的栈以及状态)，当再次创建G的时候优先从`gfree`列表里获取，这样就起到了复用G的作用，避免反复与系统交互创建内存。
 
-M0即启动后处于一个自循环状态，执行完一个G之后继续执行下一个G，反复上面的图2~图4过程。当第一个M正在繁忙而又有新的G需要执行时，会再开启一个M来执行（M0是个特殊的处理，由汇编实现的初始化，而后续的M创建则是go代码实现）.
+M0即启动后处于一个自循环状态，执行完一个G之后继续执行下一个G，反复上面的图2~图4过程。当第一个M正在繁忙而又有新的G需要执行时，会再开启一个M来执行。下面先看一下非M0的启动过程（M0是个特殊的处理，由汇编实现的初始化，而后续的M创建则是go代码实现）。
 
 ```
 // runtime/proc.go
+
+func startm(_p_ *p, spinning bool) {
+	lock(&sched.lock)
+	if _p_ == nil {
+		// 从空闲P里获取一个
+		_p_ = pidleget()
+		// 获取失败则终止
+		if _p_ == nil {
+			unlock(&sched.lock)
+			if spinning {
+				// The caller incremented nmspinning, but there are no idle Ps,
+				// so it's okay to just undo the increment and give up.
+				if int32(atomic.Xadd(&sched.nmspinning, -1)) < 0 {
+					throw("startm: negative nmspinning")
+				}
+			}
+			return
+		}
+	}
+	// 获取一个空闲的m
+	mp := mget()
+	unlock(&sched.lock)
+	// 如果没有空闲M，则new一个
+	if mp == nil {
+		var fn func()
+		if spinning {
+			// The caller incremented nmspinning, so set m.spinning in the new M.
+			fn = mspinning
+		}
+		newm(fn, _p_)
+		return
+	}
+	if mp.spinning {
+		throw("startm: m is spinning")
+	}
+	if mp.nextp != 0 {
+		throw("startm: m has p")
+	}
+	if spinning && !runqempty(_p_) {
+		throw("startm: p has runnable gs")
+	}
+	// The caller incremented nmspinning, so set m.spinning in the new M.
+	// 设置自璇状态，暂存P
+	mp.spinning = spinning
+	mp.nextp.set(_p_)
+	// 唤醒M
+	notewakeup(&mp.park)
+}
+
 func newm(fn func(), _p_ *p) {
 	// 创建一个M对象,切与P关联
 	mp := allocm(_p_, fn)
@@ -149,6 +200,18 @@ func newm(fn func(), _p_ *p) {
 	// 创建系统内核线程
 	newosproc(mp, unsafe.Pointer(mp.g0.stack.hi))
 	execLock.runlock()
+}
+
+func newosproc(mp *m, stk unsafe.Pointer) {
+	......
+
+	var oset sigset
+	sigprocmask(_SIG_SETMASK, &sigset_all, &oset)
+	errno := bsdthread_create(stk, unsafe.Pointer(mp), funcPC(mstart))
+	sigprocmask(_SIG_SETMASK, &oset, nil)
+
+	......
+	}
 }
 
 func allocm(_p_ *p, fn func()) *m {
@@ -182,7 +245,9 @@ func mstart1() {
 	schedule()
 }
 ```
-`newm`方法中通过调用`newosproc`新建一个内核线程，并把当前的M指针也传进去，把内核线程与M进行关联，内核线程就可以找到要执行的M。注意`allocm`函数创建M的同时创建了一个G与自己进行了关联，这是一个特殊的G称为`g0`，这个G并不是给用户运行的goroutine。为什么M要关联一个g0？因为runtime下执行一个G也需要用到栈空间来做执行工作，而拥有执行栈的地方只有G，因此需要为每个执行线程里配置一个g0，g0用于每个线程操作调度工作。下面即将介绍的`schedule`方法就是在g0的栈上执行的调度。
+`startm`方法开始启动一个M，首先要进行调度工作必须有调度处理器P，则从空闲的P里面获取一个P，然后在下面通过`newm`方法创建一个M与P绑定准备调度。
+
+`newm`方法中通过`newosproc`方法新建一个内核线程，把内核线程与M以及`mstart`方法指针进行关联，内核线程就可以通过`mstart`方法启动M。注意`allocm`函数创建M的同时创建了一个G与自己关联，这是一个特殊的G称为`g0`，并不是给用户运行的goroutine。为什么M要关联一个g0？因为runtime下执行一个G也需要用到栈空间来做执行工作，而拥有执行栈的地方只有G，因此需要为每个执行线程里配置一个g0，g0用于每个线程操作调度工作。下面即将介绍的`schedule`方法就是在g0的栈上执行的调度。
 
 内核线程调用`mstart1`方法开始执行调度器,最终调用`schedule`进度调度循环。下面看下是如何循环的
 
@@ -192,7 +257,6 @@ func schedule() {
 
 	// 进入gc MarkWorker 工作模式
 	if gp == nil && gcBlackenEnabled != 0 {
-		// TODO 为什么这里找不到的时候会触发下面的从global里找runq?findRunnableGCWorker是干嘛用的
 		gp = gcController.findRunnableGCWorker(_g_.m.p.ptr())
 	}
 	if gp == nil {
