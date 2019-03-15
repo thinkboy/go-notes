@@ -2,6 +2,8 @@
 
 本章主要针对Go调度相关的角度介绍。本章只看linux系统下的逻辑。代码版本GO1.9.2。
 
+本章对应详细代码注释参考：[gosrc-reader](https://github.com/thinkboy/gosrc-reader/tree/master/runtime)
+
 -------------------------------------
 
 ## 先有个简单的概念
