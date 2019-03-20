@@ -327,17 +327,17 @@ func execute(gp *g, inheritTime bool) {
 	gogo(&gp.sched)
 }
 ```
-`execute`方法先更改G的状态为`_Grunning`表示运行中,最终给`gogo`方法做实际的执行操作。而`gogo`方法则是汇编实现。
+`execute`方法先更改G的状态为`_Grunning`表示运行中,最终给`gogo`方法做实际的执行操作。而`gogo`方法则是汇编实现。再来看下`gogo`方法的实现:
 
 ```
 // runtime.asm_amd64.s
 
 TEXT runtime·gogo(SB), NOSPLIT, $16-8
-        MOVQ    buf+0(FP), BX           // gobuf
+        MOVQ    buf+0(FP), BX           // gobuf 把0偏移的8个字节给BX寄存器, gobuf结构的前8个字节就是SP指针
 
         // If ctxt is not nil, invoke deletion barrier before overwriting.
-        MOVQ    gobuf_ctxt(BX), AX
-        TESTQ   AX, AX
+        MOVQ    gobuf_ctxt(BX), AX // 在把gobuf的ctxt变量给AX寄存器
+        TESTQ   AX, AX // 判断AX寄存器是否为空,传进来gp.sched的话肯定不为空了,因此JZ nilctxt不跳转
         JZ      nilctxt
         LEAQ    gobuf_ctxt(BX), AX
         MOVQ    AX, 0(SP)
@@ -345,28 +345,56 @@ TEXT runtime·gogo(SB), NOSPLIT, $16-8
         CALL    runtime·writebarrierptr_prewrite(SB)
         MOVQ    buf+0(FP), BX
 
-nilctxt:
+nilctxt: // 下面则是函数栈的BP SP指针移动，最后进入到指定的代码区域
         MOVQ    gobuf_g(BX), DX
         MOVQ    0(DX), CX               // make sure g != nil
         get_tls(CX)
         MOVQ    DX, g(CX)
         MOVQ    gobuf_sp(BX), SP        // restore SP
-        MOVQ    gobuf_ret(BX), AX
+        MOVQ    gobuf_ret(BX), AX 
         MOVQ    gobuf_ctxt(BX), DX
         MOVQ    gobuf_bp(BX), BP
         MOVQ    $0, gobuf_sp(BX)        // clear to help garbage collector
-        MOVQ    $0, gobuf_ret(BX)
+        MOVQ    $0, gobuf_ret(BX) 
         MOVQ    $0, gobuf_ctxt(BX)
         MOVQ    $0, gobuf_bp(BX)
-        MOVQ    gobuf_pc(BX), BX
-        JMP     BX
+        MOVQ    gobuf_pc(BX), BX // PC指针即返回地址
+        JMP     BX  // 跳转到执行代码处
 ```
+```
+// runtime/runtime2.go
 
-### TODO：详细介绍gogo方法实现,目的是更深度理解调度的性能消耗有多大。
+type gobuf struct {
+	// The offsets of sp, pc, and g are known to (hard-coded in) libmach.
+	//
+	// ctxt is unusual with respect to GC: it may be a
+	// heap-allocated funcval so write require a write barrier,
+	// but gobuf needs to be cleared from assembly. We take
+	// advantage of the fact that the only path that uses a
+	// non-nil ctxt is morestack. As a result, gogo is the only
+	// place where it may not already be nil, so gogo uses an
+	// explicit write barrier. Everywhere else that resets the
+	// gobuf asserts that ctxt is already nil.
+	sp   uintptr
+	pc   uintptr
+	g    guintptr
+	ctxt unsafe.Pointer // this has to be a pointer so that gc scans it
+	ret  sys.Uintreg
+	lr   uintptr
+	bp   uintptr // for GOEXPERIMENT=framepointer
+}
+```
+`gogo`方法传的参数注意是`gp.sched`,而这个结构体里可以看到保存了熟悉的`SP/PC/BP`指针，能想象到是把执行栈传了进去(既然是执行一个G，当然要把执行栈传进去了)。可以看到在`gogo`函数中实质就只是做了函数栈指针的移动。
 
-**这里有个问题：每个P里面的G执行时间是不可控的，如果多个P同时在执行，会不会出现有的P里面的G执行不完，有的P里面几乎没有G可执行呢？**
+至此，对一个问题：Golang的goroutine调度成本有多高？也应该有了一些体会了。
 
-这就要从M的自循环过程中如何获取G、归还G的行为说起了。在上面是拿单个M在工作(也就是单个内核线程)来介绍，为符合实际场景，下面拿多个M(即多个内核线程)同时工作的场景看下工作流程：
+### 多个线程会怎样？
+
+在上面是拿单个M在工作(也就是单个内核线程)来介绍，为符合实际场景，下面拿多个M(即多个内核线程)同时工作的场景看下工作流程。
+
+**先抛出一个问题：每个P里面的G执行时间是不可控的，如果多个P同时在执行，会不会出现有的P里面的G执行不完，有的P里面几乎没有G可执行呢？**
+
+这就要从M的自循环过程中如何获取G、归还G的行为说起了，先看图：
 
 ![](images/schedule2.png)
 
