@@ -130,17 +130,21 @@ if procresize(procs) != nil {
 
 ### 最后`runtime·mstart(SB)`启动调度循环
 
-前面都是各种初始化操作，到这一步则开始真正的调度逻辑，下面来围绕G、M、P三个概念介绍Goroutine调度的运作流程。(这里启动的M就是第一个处理调度的M，也是M0)
+前面都是各种初始化操作，启动调度循环后开始真正的调度逻辑，下面来围绕G、M、P三个概念介绍Goroutine调度的运作流程。(这里启动的M就是第一个处理调度的M，也是M0)
 
-## 调度工作流程
+## 调度器工作流程
 
 ![](images/schedule.png)
 
-图1代表M启动的过程。在程序初始化的过程中说到在进程启动的最后一步启动了第一个M(即M0)，这个M从全局的空闲P列表里拿到一个P，然后与其绑定。而P里面有2个管理G的链表`runq`存储等待运行的G列表，`gfree`存储空闲的G列表，M启动后等待可执行的G。
+图1代表M启动的过程，把M跟一个P绑定再一起。在程序初始化的过程中说到在进程启动的最后一步启动了第一个M(即M0)，这个M从全局的空闲P列表里拿到一个P，然后与其绑定。而P里面有2个管理G的链表`runq`存储等待运行的G列表，`gfree`存储空闲的G列表，M启动后等待可执行的G。
 
 图2代表创建G的过程。创建一个G先扔到当前P的`runq`待运行队列里。在图3的执行过程里，M从绑定的P的`runq`列表里获取一个G来执行。当执行完成后，图4的流程里把G仍到`gfree`队列里。注意此时G并没有销毁(只重置了G的栈以及状态)，当再次创建G的时候优先从`gfree`列表里获取，这样就起到了复用G的作用，避免反复与系统交互创建内存。
 
-M0即启动后处于一个自循环状态，执行完一个G之后继续执行下一个G，反复上面的图2~图4过程。当第一个M正在繁忙而又有新的G需要执行时，会再开启一个M来执行。下面先看一下非M0的启动过程（M0启动是个特殊的启动过程，由汇编实现的初始化后启动，而后续的M创建以及启动则是Go代码实现）。
+M即启动后处于一个自循环状态，执行完一个G之后继续执行下一个G，反复上面的图2~图4过程。当第一个M正在繁忙而又有新的G需要执行时，会再开启一个M来执行。
+
+### 调度器如何开启调度循环
+
+先看一下M的启动过程（M0启动是个特殊的启动过程，由汇编实现的初始化后启动，而普通的M创建以及启动则是Go代码实现）。
 
 ```
 // runtime/proc.go
@@ -194,7 +198,7 @@ func startm(_p_ *p, spinning bool) {
 }
 
 func newm(fn func(), _p_ *p) {
-	// 创建一个M对象,切与P关联
+	// 创建一个M对象,且与P关联
 	mp := allocm(_p_, fn)
 	// 暂存P
 	mp.nextp.set(_p_)
@@ -208,16 +212,14 @@ func newm(fn func(), _p_ *p) {
 	execLock.runlock()
 }
 
+// runtime/os_linux.go
 func newosproc(mp *m, stk unsafe.Pointer) {
-	......
-
+	// Disable signals during clone, so that the new thread starts
+	// with signals disabled. It will enable them in minit.
 	var oset sigset
 	sigprocmask(_SIG_SETMASK, &sigset_all, &oset)
-	errno := bsdthread_create(stk, unsafe.Pointer(mp), funcPC(mstart))
+	ret := clone(cloneFlags, stk, unsafe.Pointer(mp), unsafe.Pointer(mp.g0), unsafe.Pointer(funcPC(mstart)))
 	sigprocmask(_SIG_SETMASK, &oset, nil)
-
-	......
-	}
 }
 
 func allocm(_p_ *p, fn func()) *m {
@@ -261,7 +263,9 @@ func mstart1() {
 
 `newm`方法中通过`newosproc`方法新建一个内核线程，把内核线程与M以及`mstart`方法进行关联，这样内核线程就可以找到M并且同时找到`mstart`方法启动调度工作，并且执行调度任务。注意`allocm`函数创建M的同时创建了一个G与自己关联，这个G就是我们在上面说到的`g0`。为什么M要关联一个g0？因为runtime下执行一个G也需要用到栈空间来完成调度工作，而拥有执行栈的地方只有G，因此需要为每个执行线程里配置一个g0。
 
-内核线程调用`mstart`方法开始执行调度器,最终调用`schedule`进入调度器的调度循环，在这个方法里永远不再返回。下面看下是如何循环的
+### 调度器如何进行调度循环
+
+内核线程调用`mstart`方法开始执行调度器,最终调用`schedule`进入调度器的调度循环，在这个方法里永远不再返回。
 
 ```
 func schedule() {
@@ -386,11 +390,80 @@ type gobuf struct {
 ```
 `gogo`方法传的参数注意是`gp.sched`,而这个结构体里可以看到保存了熟悉的`SP/PC/BP`指针，能想象到是把执行栈传了进去(既然是执行一个G，当然要把执行栈传进去了)。可以看到在`gogo`函数中实质就只是做了函数栈指针的移动。
 
-至此，对一个问题：Golang的goroutine调度成本有多高？也应该有了一些体会了。
+### 调度循环中如何上下文切换？
+
+上面介绍的是调度中执行G的过程，那G和G之间的切换又是怎么完成的？在runtime下面有个`gopark`方法来完成切换，直接看代码。
+
+```
+// runtime/proc.go
+
+func gopark(unlockf func(*g, unsafe.Pointer) bool, lock unsafe.Pointer, reason string, traceEv byte, traceskip int) {
+	mp := acquirem()
+	gp := mp.curg
+	status := readgstatus(gp)
+	if status != _Grunning && status != _Gscanrunning {
+		throw("gopark: bad g status")
+	}
+	mp.waitlock = lock
+	mp.waitunlockf = *(*unsafe.Pointer)(unsafe.Pointer(&unlockf))
+	gp.waitreason = reason
+	mp.waittraceev = traceEv
+	mp.waittraceskip = traceskip
+	releasem(mp)
+	// can't do anything that might move the G between Ms here.
+	// mcall 在M里从当前正在运行的G切换到g0
+	// park_m 在切换到的g0下先把传过来的G切换为_Gwaiting状态挂起该G
+	// 调用回调函数waitunlockf()由外层决定是否等待解锁，返回true则等待解锁不在执行G，返回false则不等待解锁继续执行
+	mcall(park_m)
+}
+```
+```
+// runtime/stubs.go
+
+// mcall switches from the g to the g0 stack and invokes fn(g),
+// where g is the goroutine that made the call.
+// mcall saves g's current PC/SP in g->sched so that it can be restored later.
+......
+func mcall(fn func(*g))
+```
+```
+// runtime/proc.go
+
+func park_m(gp *g) {
+	_g_ := getg() // 此处获得的是g0,而不是gp
+
+	if trace.enabled {
+		traceGoPark(_g_.m.waittraceev, _g_.m.waittraceskip)
+	}
+
+	casgstatus(gp, _Grunning, _Gwaiting)
+	dropg() // 把g0从M的"当前运行"里剥离出来
+
+	if _g_.m.waitunlockf != nil {
+		fn := *(*func(*g, unsafe.Pointer) bool)(unsafe.Pointer(&_g_.m.waitunlockf))
+		ok := fn(gp, _g_.m.waitlock)
+		_g_.m.waitunlockf = nil
+		_g_.m.waitlock = nil
+		if !ok { // 如果不需要等待解锁，则切换到_Grunnable状态并直接执行G
+			if trace.enabled {
+				traceGoUnpark(gp, 2)
+			}
+			casgstatus(gp, _Gwaiting, _Grunnable)
+			execute(gp, true) // Schedule it back, never returns.
+		}
+	}
+	schedule()
+}
+```
+`gopark`是进行调度出让CPU资源的方法，里面有个方法`mcall()`，注释里这样描述：
+
+* 从当前运行的G切换到g0的运行栈上，然后调用fn(g)，这里被调用的g是调用mcall方法时的G。`mcall`函数保存当前运行的G的 PC/SP 到 g->sched 里，因此该G可以在以后被重新恢复执行.
+
+在本章开始介绍初始化过程中有提到M启动的时候绑定了一个g0，调度工作是运行在g0的栈上的，`mcall`方法就是此时用到的这个g0。它的做法是先把当前调用的G的执行栈暂存到`g->sched`变量里，然后切换到g0的执行栈上开始进行调度工作。注释里说的fn(g)也就是`park_m(gp *g)`方法，所以进入到`park_m`方法里其实也进入到了g0的执行栈里了，参数 gp 就是当前执行`mall`的G，方法里把gp的状态从`_Grunning`切换到`_Gwaiting`表明进入到等待唤醒状态，此时休眠G的操作就完成了。接下来既然休眠了G了，CPU线程总不能闲下来，在`park_m`方法里又可以看到`schedule`方法，开始进入到调度循环了。
+
+`park_m`方法里还有段小插曲，进入调度循环之前还有个对`waitunlockf`方法的判断，该方法意思是如果解锁不成功则调用`execute`方法继续执行之前的G，而该方法永远不会return，也就不会再次进入下一次调度。也就是说给外层一个控制是否要进行下一个调度的选择。
 
 ### 多个线程会怎样？
-
-在上面是拿单个M在工作(也就是单个内核线程)来介绍，为符合实际场景，下面拿多个M(即多个内核线程)同时工作的场景看下工作流程。
 
 **先抛出一个问题：每个P里面的G执行时间是不可控的，如果多个P同时在执行，会不会出现有的P里面的G执行不完，有的P里面几乎没有G可执行呢？**
 
@@ -595,7 +668,60 @@ func runqgrab(_p_ *p, batch *[256]guintptr, batchHead uint32, stealRunNextG bool
 ```
 上面可以看出从别的P里面偷(steal)了一半，这样就足够运行了。有了“偷取”操作也就充分利用多线程的资源。
 
-到这里调度器的调度过程介绍基本完成了。光有了调度器的实现以及调度流程似乎并不能很好的理解调度原理。下面拿个常见应用场景看如何利用这个调度器的。
+### G如何进入调度器的调度循环
+
+```
+// runtime/proc.go
+
+func newproc(siz int32, fn *funcval) {
+	argp := add(unsafe.Pointer(&fn), sys.PtrSize)
+	pc := getcallerpc(unsafe.Pointer(&siz))
+	systemstack(func() {
+		newproc1(fn, (*uint8)(argp), siz, 0, pc)
+	})
+}
+
+func newproc1(fn *funcval, argp *uint8, narg int32, nret int32, callerpc uintptr) *g {
+	......
+	
+	_p_ := _g_.m.p.ptr()
+	// 从当前P里面复用一个空闲G
+	newg := gfget(_p_)
+	// 如果没有空闲G则新建一个,默认堆大小为_StackMin=2048 bytes
+	if newg == nil {
+		newg = malg(_StackMin)
+		casgstatus(newg, _Gidle, _Gdead)
+		// 把新创建的G添加到全局allg里
+		allgadd(newg) // publishes with a g->status of Gdead so GC scanner doesn't look at uninitialized stack.
+	}
+
+	......
+	
+	if isSystemGoroutine(newg) {
+		atomic.Xadd(&sched.ngsys, +1)
+	}
+	newg.gcscanvalid = false
+	casgstatus(newg, _Gdead, _Grunnable)
+
+	// 把G放到P里的待运行队列，第三参数设置为true，表示要放到runnext里，作为优先要执行的G
+	runqput(_p_, newg, true)
+
+	// 如果有其它空闲P则尝试唤醒某个M来执行
+	// 如果有M处于自璇等待P或G状态，放弃。
+	// NOTE: sched.nmspinning!=0说明正在有M被唤醒，这里判断sched.nmspinnin==0时才进入wakep是防止同时唤醒多个M
+	if atomic.Load(&sched.npidle) != 0 && atomic.Load(&sched.nmspinning) == 0 && mainStarted {
+		wakep()
+	}
+	
+	......
+	
+	return newg
+}
+```
+
+当开启一个Goroutine的时候用到`go func()`这样的语法，在runtime下其实调用的就是`newproc`方法，实质实现是`newproc1`,在该方法中`gfget`先从空闲的G列表获取一个G，最后`runqput`放到当前P待运行队列里。
+
+结尾：到这里调度器的调度过程介绍基本完成了。光有了调度器的实现以及调度流程似乎并不能很好的理解调度原理。下面拿个常见应用场景看如何利用这个调度器的。
 
 ## 举例一个触发调度的场景
 
@@ -625,89 +751,15 @@ func timeSleep(ns int64) {
 	goparkunlock(&timers.lock, "sleep", traceEvGoSleep, 2) // 切到G0让出CPU,进入休眠
 }
 ```
-
-`timeSleep`函数里通过`addtimerLocked`把定时器加入到timer管理器（timer通过最小堆的数据结构存放每个定时器，在这不做详细说明）后，再通过`goparkunlock`实现把当前G休眠。下面看下该方法如何休眠G的：
-
 ```
 // runtime/time.go
 
 func goparkunlock(lock *mutex, reason string, traceEv byte, traceskip int) {
 	gopark(parkunlock_c, unsafe.Pointer(lock), reason, traceEv, traceskip)
 }
-
-func gopark(unlockf func(*g, unsafe.Pointer) bool, lock unsafe.Pointer, reason string, traceEv byte, traceskip int) {
-	mp := acquirem()
-	gp := mp.curg
-	status := readgstatus(gp)
-	if status != _Grunning && status != _Gscanrunning {
-		throw("gopark: bad g status")
-	}
-	mp.waitlock = lock
-	mp.waitunlockf = *(*unsafe.Pointer)(unsafe.Pointer(&unlockf))
-	gp.waitreason = reason
-	mp.waittraceev = traceEv
-	mp.waittraceskip = traceskip
-	releasem(mp)
-	// can't do anything that might move the G between Ms here.
-	// mcall 在M里从当前正在运行的G切换到g0
-	// park_m 在切换到的g0下先把传过来的G切换为_Gwaiting状态挂起该G
-	// 调用回调函数waitunlockf()由外层决定是否等待解锁，返回true则等待解锁不在执行G，返回false则不等待解锁继续执行
-	mcall(park_m)
-}
 ```
-```
-// runtime/stubs.go
 
-// mcall switches from the g to the g0 stack and invokes fn(g),
-// where g is the goroutine that made the call.
-// mcall saves g's current PC/SP in g->sched so that it can be restored later.
-......
-func mcall(fn func(*g))
-```
-```
-// runtime/time.go
-
-func park_m(gp *g) {
-	_g_ := getg() // 此处获得的是g0,而不是gp
-
-	if trace.enabled {
-		traceGoPark(_g_.m.waittraceev, _g_.m.waittraceskip)
-	}
-
-	casgstatus(gp, _Grunning, _Gwaiting)
-	dropg() // 把g0从M的"当前运行"里剥离出来
-
-	if _g_.m.waitunlockf != nil {
-		fn := *(*func(*g, unsafe.Pointer) bool)(unsafe.Pointer(&_g_.m.waitunlockf))
-		ok := fn(gp, _g_.m.waitlock)
-		_g_.m.waitunlockf = nil
-		_g_.m.waitlock = nil
-		if !ok { // 如果不需要等待解锁，则切换到_Grunnable状态并直接执行G
-			if trace.enabled {
-				traceGoUnpark(gp, 2)
-			}
-			casgstatus(gp, _Gwaiting, _Grunnable)
-			execute(gp, true) // Schedule it back, never returns.
-		}
-	}
-	schedule()
-}
-```
-`goparkunlock`方法实质是依赖`gopark`的实现，而`gopark`才是进行调度的方法，里面有个方法`mcall()`，注释里这样描述：
-
-* 从当前运行的G切换到g0的运行栈上，然后调用fn(g)，这里被调用的g是调用mcall方法时的G。`mcall`函数保存当前运行的G的 PC/SP 到 g->sched 里，因此该G可以在以后被重新恢复执行.
-
-在本章开始介绍初始化过程中有提到M0启动的时候绑定了一个g0，调度工作是运行在g0的栈上的，`mcall`方法就是此时用到的这个g0。它的做法是先把当前调用的G的执行栈暂存到`g->sched`变量里，然后切换到g0的执行栈上开始进行调度工作。注释里说的fn(g)也就是`park_m(gp *g)`方法，所以进入到`park_m`方法里其实也进入到了g0的执行栈里了，参数 gp 就是当前执行`mall`的G，方法里把gp的状态从`_Grunning`切换到`_Gwaiting`表明进入到等待唤醒状态，此时休眠G的操作就完成了。接下来既然休眠了G了，CPU线程总不能闲下来，在`park_m`方法里又可以看到`schedule`方法，开始进入到调度循环了。
-
-`park_m`方法里还有段小插曲，进入调度循环之前还有个对`waitunlockf`方法的判断，该方法意思是如果解锁不成功则调用`execute`方法继续执行之前的G，而该方法永远不会return(后面会介绍为什么不会return)，也就不会再次进入调度。往回追溯看下`waitunlockf`方法做了啥，以及他要解的`waitlock`锁又是哪来的？首先锁以及解锁方法是在g0的m变量里的，调用`park_m`方法之前在`gopark`方法里面先通过`acquirem`获取了当前执行G所在的M，然后把锁以及锁方法保存在当前的M里，而该M和切换到g0关联的是同一个M，`gopark`里的锁和方法又来源于`goparkunlock`，`goparkunlock`的锁即是`timeSleep`方法里把`timers.lock`锁传了进去，因此解的锁是timer管理器的全局锁，这个锁是锁住最小堆的调整。`parkunlock_c`方法实现如下：
-
-```
-func parkunlock_c(gp *g, lock unsafe.Pointer) bool {
-	unlock((*mutex)(lock))
-	return true
-}
-```
-也就是说一定会解锁，且返回true。那么在`park_m`方法里一定不会执行`execute`,也就是说在`time.Sleep`这个例子里一定会执行`schedule`方法进入，这里就进入到了上面介绍调度工作流程的调度循环里了。
+`timeSleep`函数里通过`addtimerLocked`把定时器加入到timer管理器（timer通过最小堆的数据结构存放每个定时器，在这不做详细说明）后，再通过`goparkunlock`实现把当前G休眠，这里看到了上面提到的`gopark`方法进行调度循环的上下文切换。
 
 上面介绍的是一个G如何进入到休眠状态的过程，该例子是个定时器，当时间到了的话，当前G就要被唤醒继续执行了。下面就介绍下唤醒的流程。
 
@@ -736,6 +788,8 @@ func addtimerLocked(t *timer) {
 }
 ```
 ```
+// runtime/time.go
+
 // Timerproc runs the time-driven events.
 // It sleeps until the next event in the timers heap.
 // If addtimer inserts a new earlier event, it wakes timerproc early.
@@ -803,7 +857,19 @@ func timerproc() {
 即通过`goroutineReady`方法唤醒。方法调用过程: `goroutineReady() -> ready()`
 
 ```
+// runtime/time.go
+func goroutineReady(arg interface{}, seq uintptr) {
+	goready(arg.(*g), 0)
+}
+```
+```
 // runtime/proc.go
+
+func goready(gp *g, traceskip int) {
+	systemstack(func() {
+		ready(gp, traceskip, true)
+	})
+}
 
 // Mark gp ready to run.
 func ready(gp *g, traceskip int, next bool) {
@@ -828,11 +894,9 @@ func ready(gp *g, traceskip int, next bool) {
 	......
 }
 ```
-在上面的方法里可以看到先把休眠的G从`_Gwaiting`切换到`_Grunnable`状态，表明已经可运行。然后通过`runqput`方法把G放到P的待运行队列里，在调度工作流程里等待运行了。
+在上面的方法里可以看到先把休眠的G从`_Gwaiting`切换到`_Grunnable`状态，表明已经可运行。然后通过`runqput`方法把G放到P的待运行队列里，就进入到调度器的调度循环里了。
 
-总结下：time.Sleep想要进入阻塞(休眠)状态，其实是通过`park_m`方法给自己标记个`_Gwaiting`状态，然后把自己所占用的CPU线程资源给释放出来，继续执行调度任务，调度其它的G来运行。而唤醒是通过把G更改回`_Grunnable`状态后，然后把G放入到P的待运行队列里等待执行。通过这点可以看出休眠中的G其实并不占用CPU资源，最多是占用内存，是个很轻量级的阻塞。
-
-### TODO 细分析下mall的逻辑切换的成本有多高？目的是更深度理解调度的性能消耗有多大。
+总结下：time.Sleep想要进入阻塞(休眠)状态，其实是通过`gopark`方法给自己标记个`_Gwaiting`状态，然后把自己所占用的CPU线程资源给释放出来，继续执行调度任务，调度其它的G来运行。而唤醒是通过把G更改回`_Grunnable`状态后，然后把G放入到P的待运行队列里等待执行。通过这点还可以看出休眠中的G其实并不占用CPU资源，最多是占用内存，是个很轻量级的阻塞。
 
 ## 再看几个触发调度的场景
 
