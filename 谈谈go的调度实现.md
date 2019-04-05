@@ -86,7 +86,7 @@ G0是什么？G分三种，第一种是执行用户任务的叫做G，第二种�
 
 我们按照顺序来详细看是怎么完成上面三个事情的。
 
-### 首先`runtime.osinit(SB)`函数针对系统环境的初始化
+### `runtime.osinit(SB)`函数针对系统环境的初始化
 
 这里实质只做了一件事情，就是获取CPU的线程数，也就是Top命令里看到的CPU0、CPU1、CPU2......的数量
 
@@ -97,7 +97,7 @@ func osinit() {
 	ncpu = getproccount()
 }
 ```
-### 接下来`runtime.schedinit(SB)`就要做各种初始化
+### `runtime.schedinit(SB)`调度相关的一些初始化
 
 ```
 // runtime/proc.go
@@ -129,6 +129,23 @@ if procresize(procs) != nil {
 `procresize`初始化P的数量，`procs`参数为初始化的数量，而在初始化之前先做数量的判断，默认是`ncpu`(与CPU核数相等)，也可以通过环境变量`GOMAXPROCS`来控制P的数量。`_MaxGomaxprocs`控制了最大的P数量只能是1024。
 
 [tip] 我们在进程初始化的时候经常用到`runtime.GOMAXPROCS()`函数，其实也是调用的`procresize`方法重新设置了最大CPU使用数量。
+
+### `runtime·mainPC(SB)`启动监控任务
+```
+
+// The main goroutine.
+func main() {
+	......
+	
+	// 启动后台监控
+	systemstack(func() {
+		newm(sysmon, nil)
+	})
+
+	......
+}
+```
+在runtime下的main方法里跟调度相关的只有一个启动监控任务，该任务用于监控是否有过长时间执行的G，并进行抢占，下面会详细说到。
 
 ### 最后`runtime·mstart(SB)`启动调度循环
 
@@ -672,6 +689,148 @@ func runqgrab(_p_ *p, batch *[256]guintptr, batchHead uint32, stealRunNextG bool
 ```
 上面可以看出从别的P里面偷(steal)了一半，这样就足够运行了。有了“偷取”操作也就充分利用多线程的资源。
 
+### G执行时间过长如何抢占
+
+回想在`runtime.main()`里面有单独启动了一个监控任务，方法是`sysmon`。看下该方法：
+
+```
+// runtime/proc.go
+
+func sysmon() {
+	......
+	
+	for {
+		// delay参数用于控制for循环的间隔，不至于无限死循环。
+		// 控制逻辑是前50次每次sleep 20微秒，超过50次则每次翻2倍，直到最大10毫秒
+		if idle == 0 { // start with 20us sleep...
+			delay = 20
+		} else if idle > 50 { // start doubling the sleep after 1ms...
+			delay *= 2
+		}
+		if delay > 10*1000 { // up to 10ms
+			delay = 10 * 1000
+		}
+		usleep(delay)
+		
+		......
+		
+		// retake P's blocked in syscalls
+		// and preempt long running G's
+		if retake(now) != 0 {
+			idle = 0
+		} else {
+			idle++
+		}
+		
+		......
+	}
+}
+
+func retake(now int64) uint32 {
+	n := 0
+	for i := int32(0); i < gomaxprocs; i++ {
+		_p_ := allp[i] // 从所有P里面去找
+		if _p_ == nil {
+			continue
+		}
+		pd := &_p_.sysmontick
+		s := _p_.status
+		if s == _Psyscall {
+		
+			......
+			
+		} else if s == _Prunning { // 针对正在运行的P
+			// Preempt G if it's running for too long.
+			t := int64(_p_.schedtick)
+			if int64(pd.schedtick) != t {
+				pd.schedtick = uint32(t)
+				pd.schedwhen = now
+				continue
+			}
+			// 如果已经超过forcePreemptNS(10ms)，则抢占
+			if pd.schedwhen+forcePreemptNS > now {
+				continue
+			}
+			// 抢占P
+			preemptone(_p_)
+		}
+	}
+	return uint32(n)
+}
+
+func preemptone(_p_ *p) bool {
+	mp := _p_.m.ptr()
+	if mp == nil || mp == getg().m {
+		return false
+	}
+	// 找到当前正在运行的G
+	gp := mp.curg
+	if gp == nil || gp == mp.g0 {
+		return false
+	}
+	// 标记抢占状态
+	gp.preempt = true
+
+	// Every call in a go routine checks for stack overflow by
+	// comparing the current stack pointer to gp->stackguard0.
+	// Setting gp->stackguard0 to StackPreempt folds
+	// preemption into the normal stack overflow check.
+	// G里面的每一次调用都会比较当前栈指针与 gp->stackguard0 来检查堆栈溢出
+	// 设置 gp->stackguard0 为 StackPreempt 来触发正常的堆栈溢出检测
+	gp.stackguard0 = stackPreempt
+	return true
+}
+```
+`sysmon()`方法处于无限for循环，整个进程的生命周期监控着。`retake()`方法每次对所有的P遍历检查是否超过10ms的还在运行的执行器(P)，如果有超过10ms的则通过`preemptone()`进行抢占，但是要注意看这个方法的实现，其实并没有做什么实质的停止运行操作，而只是做了个抢占的标记，唯一的一个操作就是给gp.stackguard0赋值了一个`stackPreempt`，因此这里的抢占实质只是一个标记抢占。那么真正停止P执行的操作在哪里？
+
+```
+// runtime/stack.go
+
+func newstack(ctxt unsafe.Pointer) {
+	......
+	
+	// NOTE: stackguard0 may change underfoot, if another thread
+	// is about to try to preempt gp. Read it just once and use that same
+	// value now and below.
+	// 这里的逻辑是为G的抢占做的判断。
+	// 判断是否是抢占引发栈扩张，如果 gp.stackguard0 == stackPreempt 则说明是抢占触发的栈扩张
+	preempt := atomic.Loaduintptr(&gp.stackguard0) == stackPreempt
+
+	......
+
+	//如果判断可以抢占, 则继续判断是否GC引起的, 如果是则对G的栈空间执行标记处理(扫描根对象)然后继续运行,
+	//如果不是GC引起的则调用gopreempt_m函数完成抢占.
+	if preempt {
+		......
+		
+		// 停止当前运行状态的G,最后放到全局runq里,释放M
+		// 这里会进入schedule循环.阻塞到这里
+		gopreempt_m(gp) // never return
+	}
+
+	......
+}
+```
+```
+// runtime/proc.go
+
+func goschedImpl(gp *g) {
+	status := readgstatus(gp)
+	if status&^_Gscan != _Grunning {
+		dumpgstatus(gp)
+		throw("bad g status")
+	}
+	casgstatus(gp, _Grunning, _Grunnable)
+	dropg()
+	lock(&sched.lock)
+	globrunqput(gp)
+	unlock(&sched.lock)
+
+	schedule()
+}
+```
+我们都知道Go的调度是非抢占式的，要想实现G不被长时间，就只能主动触发抢占，而Go触发抢占的实际就是栈扩张的时候，在`newstack`新创建栈空间的时候检测是否有抢占标记，如果有则通过`goschedImpl`方法再次进入到熟悉的`schedule`调度循环。判断是否抢占的标记就是判断`gp.stackguard0`是否等于`stackPreempt`。
+
 ### G如何进入调度器的调度循环
 
 ```
@@ -725,7 +884,7 @@ func newproc1(fn *funcval, argp *uint8, narg int32, nret int32, callerpc uintptr
 
 当开启一个Goroutine的时候用到`go func()`这样的语法，在runtime下其实调用的就是`newproc`方法，实质实现是`newproc1`,在该方法中`gfget`先从空闲的G列表获取一个G，最后`runqput`放到当前P待运行队列里。
 
-结尾：到这里调度器的调度过程介绍基本完成了。光有了调度器的实现以及调度流程似乎并不能很好的理解调度原理。下面拿个常见应用场景看如何利用这个调度器的。
+总结：到这里调度器的调度过程介绍基本完成了。光有了调度器的实现以及调度流程似乎并不能很好的理解调度原理。下面拿几个常见应用场景看如何利用这个调度器的。
 
 ## 看几个调度相关的场景
 
@@ -756,7 +915,7 @@ func timeSleep(ns int64) {
 }
 ```
 ```
-// runtime/time.go
+// runtime/proc.go
 
 func goparkunlock(lock *mutex, reason string, traceEv byte, traceskip int) {
 	gopark(parkunlock_c, unsafe.Pointer(lock), reason, traceEv, traceskip)
@@ -842,18 +1001,7 @@ func timerproc() {
 			f(arg, seq)
 			lock(&timers.lock)
 		}
-		if delta < 0 || faketime > 0 {
-			// No timers left - put goroutine to sleep.
-			timers.rescheduling = true
-			goparkunlock(&timers.lock, "timer goroutine (idle)", traceEvGoBlock, 1)
-			continue
-		}
-		// At least one timer pending. Sleep until then.
-		timers.sleeping = true
-		timers.sleepUntil = now + delta
-		noteclear(&timers.waitnote)
-		unlock(&timers.lock)
-		notetsleepg(&timers.waitnote, delta)
+		......
 	}
 }
 ```
@@ -862,6 +1010,7 @@ func timerproc() {
 
 ```
 // runtime/time.go
+
 func goroutineReady(arg interface{}, seq uintptr) {
 	goready(arg.(*g), 0)
 }
@@ -902,14 +1051,175 @@ func ready(gp *g, traceskip int, next bool) {
 
 总结：time.Sleep想要进入阻塞(休眠)状态，其实是通过`gopark`方法给自己标记个`_Gwaiting`状态，然后把自己所占用的CPU线程资源给释放出来，继续执行调度任务，调度其它的G来运行。而唤醒是通过把G更改回`_Grunnable`状态后，然后把G放入到P的待运行队列里等待执行。通过这点还可以看出休眠中的G其实并不占用CPU资源，最多是占用内存，是个很轻量级的阻塞。
 
-### fumex
+### Mutex
+
+```
+// sync/mutex.go
+
+func (m *Mutex) Lock() {
+	// Fast path: grab unlocked mutex.
+	// 首先尝试抢锁，如果抢到则直接返回,并标记mutexLocked状态
+	if atomic.CompareAndSwapInt32(&m.state, 0, mutexLocked) {
+		if race.Enabled {
+			race.Acquire(unsafe.Pointer(m))
+		}
+		return
+	}
+
+	var waitStartTime int64
+	starving := false
+	awoke := false
+	iter := 0
+	old := m.state
+	for {
+		// Don't spin in starvation mode, ownership is handed off to waiters
+		// so we won't be able to acquire the mutex anyway.
+		// 尝试自璇,但有如下几个条件跳过自璇,这里的自璇是用户态自璇,基本lock的cpu消耗都耗到这里了
+		// 1.不在饥饿模式自璇
+		// 2.超过4次循环，则不再自璇. (runtime_canSpin里面)
+		// 3.全部P空闲时，不自璇.(runtime_canSpin里面)
+		// 4.当前P里无运行G时，不自璇.(runtime_canSpin里面)
+		if old&(mutexLocked|mutexStarving) == mutexLocked && runtime_canSpin(iter) {
+			// Active spinning makes sense.
+			// Try to set mutexWoken flag to inform Unlock
+			// to not wake other blocked goroutines.
+			if !awoke && old&mutexWoken == 0 && old>>mutexWaiterShift != 0 &&
+				atomic.CompareAndSwapInt32(&m.state, old, old|mutexWoken) {
+				awoke = true
+			}
+			runtime_doSpin() // doSpin其实就是用户态自璇30次
+			iter++
+			old = m.state
+			continue
+		}
+		
+		......
+		
+		if atomic.CompareAndSwapInt32(&m.state, old, new) {
+			......
+			
+			runtime_SemacquireMutex(&m.sema, queueLifo)                                     // 这里会再次自璇几次,然后最后切换到g0把G标记_Gwaiting状态阻塞在这里
+			starving = starving || runtime_nanotime()-waitStartTime > starvationThresholdNs // 如果锁等了1毫秒才被唤醒，才会标记为饥饿模式
+			old = m.state
+			
+			......
+		} else {
+			old = m.state
+		}
+	}
+
+	if race.Enabled {
+		race.Acquire(unsafe.Pointer(m))
+	}
+}
+```
+```
+// runtime/sema.go
+
+func sync_runtime_Semacquire(addr *uint32) {
+	semacquire1(addr, false, semaBlockProfile)
+}
+
+func semacquire1(addr *uint32, lifo bool, profile semaProfileFlags) {
+	......
+	
+	for {
+		......
+		
+		// Any semrelease after the cansemacquire knows we're waiting
+		// (we set nwait above), so go to sleep.
+		root.queue(addr, s, lifo)                                     // 把当前锁的信息存起来以便以后唤醒时找到当前G,G是在queue里面获取的。
+		goparkunlock(&root.lock, "semacquire", traceEvGoBlockSync, 4) // 进行休眠，然后阻塞在这里
+		if s.ticket != 0 || cansemacquire(addr) {
+			break
+		}
+	}
+}
+
+// queue adds s to the blocked goroutines in semaRoot.
+func (root *semaRoot) queue(addr *uint32, s *sudog, lifo bool) {
+	s.g = getg() // 这里记录了当前的G，以便唤醒的时候找到要被唤醒的G
+	s.elem = unsafe.Pointer(addr)
+	s.next = nil
+	s.prev = nil
+
+	var last *sudog
+	pt := &root.treap
+	for t := *pt; t != nil; t = *pt {
+		......
+		
+		last = t
+		if uintptr(unsafe.Pointer(addr)) < uintptr(t.elem) {
+			pt = &t.prev
+		} else {
+			pt = &t.next
+		}
+	}
+
+	......
+```
+`Mutex.Lock`方法通过调用`runtime_SemacquireMutex`最终还是调用`goparkunlock`实现把G进入到休眠状态。在进入休眠之前先把自己加入到队列里`root.queue(addr, s, lifo)`，在`queue`方法里，记录了当前的G，以便以后找到并唤醒。
+
+```
+func (m *Mutex) Unlock() {
+	......
+	
+	if new&mutexStarving == 0 { // 如果不是饥饿模式
+		old := new
+		for {
+			......
+			
+			if atomic.CompareAndSwapInt32(&m.state, old, new) {
+				runtime_Semrelease(&m.sema, false) // 唤醒锁
+				return
+			}
+			old = m.state
+		}
+	} else {
+		// Starving mode: handoff mutex ownership to the next waiter.
+		// Note: mutexLocked is not set, the waiter will set it after wakeup.
+		// But mutex is still considered locked if mutexStarving is set,
+		// so new coming goroutines won't acquire it.
+		runtime_Semrelease(&m.sema, true) // 唤醒锁
+	}
+}
+```
+```
+// runtime/sema.go
+
+func sync_runtime_Semrelease(addr *uint32, handoff bool) {
+	semrelease1(addr, handoff)
+}
+
+func semrelease1(addr *uint32, handoff bool) {
+	root := semroot(addr)
+	s, t0 := root.dequeue(addr)
+	if s != nil {
+		atomic.Xadd(&root.nwait, -1)
+	}
+	
+	......
+	
+	if s != nil { // May be slow, so unlock first
+		......
+		
+		readyWithTime(s, 5)
+	}
+}
+
+func readyWithTime(s *sudog, traceskip int) {
+	if s.releasetime != 0 {
+		s.releasetime = cputicks()
+	}
+	goready(s.g, traceskip)
+}
+```
+`Mutex. Unlock`方法通过调用`runtime_Semrelease `最终还是调用`goready`实现把G唤醒。
 
 ### channel
 
-### 系统调用
-
 ### 网络IO
 
-### 抢占
+### 系统调用
 
-### GC STW时调度有什么不同？
+### GC STW时调度都收到什么影响？
