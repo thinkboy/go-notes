@@ -2,7 +2,7 @@
 
 本章主要针对Go调度相关的角度介绍。本章只看linux系统下的逻辑。代码版本GO1.9.2。
 
-本章对应详细代码注释参考：[gosrc-reader](https://github.com/thinkboy/gosrc-reader/tree/master/runtime)
+本章例子中的代码对应详细注释参考：[gosrc-reader](https://github.com/thinkboy/gosrc-reader/tree/master/runtime)
 
 -------------------------------------
 
@@ -1161,6 +1161,8 @@ func (root *semaRoot) queue(addr *uint32, s *sudog, lifo bool) {
 `Mutex.Lock`方法通过调用`runtime_SemacquireMutex`最终还是调用`goparkunlock`实现把G进入到休眠状态。在进入休眠之前先把自己加入到队列里`root.queue(addr, s, lifo)`，在`queue`方法里，记录了当前的G，以便以后找到并唤醒。
 
 ```
+// sync/mutex.go
+
 func (m *Mutex) Unlock() {
 	......
 	
