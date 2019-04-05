@@ -1220,6 +1220,183 @@ func readyWithTime(s *sudog, traceskip int) {
 
 ### channel
 
+```
+// runtime/chan.go
+
+func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
+	// 寻找一个等待中的receiver，直接把值传给这个receiver，绕过下面channel buffer，
+	// 避免从sender buffer->chan buffer->receiver buffer，而是直接sender buffer->receiver buffer，仍然做了内存copy
+	if sg := c.recvq.dequeue(); sg != nil {
+		send(c, sg, ep, func() { unlock(&c.lock) }, 3)
+		return true
+	}
+
+	// 如果没有receiver等待:
+	// 如果当前chan里的元素个数小于环形队列大小(也就是chan还没满),则把内存拷贝到channel buffer里，然后直接返回。
+	// 注意dataqsiz是允许为0的，当为0时，也不存在该if里面的内存copy
+	if c.qcount < c.dataqsiz {
+		// Space is available in the channel buffer. Enqueue the element to send.
+		qp := chanbuf(c, c.sendx) // 获取即将要写入的chan buffer的指针地址
+		if raceenabled {
+			raceacquire(qp)
+			racerelease(qp)
+		}
+		// 把元素内存拷贝进去.
+		// 注意这里产生了一次内存copy,也就是说如果没有receiver的话，就一定会产生内存拷贝
+		typedmemmove(c.elemtype, qp, ep)
+		c.sendx++ // 发送索引+1
+		if c.sendx == c.dataqsiz {
+			c.sendx = 0
+		}
+		c.qcount++ // 队列元素计数器+1
+		unlock(&c.lock)
+		return true
+	}
+
+	if !block { // 如果是非阻塞的，到这里就可以结束了
+		unlock(&c.lock)
+		return false
+	}
+
+	// ########下面是进入阻塞模式的如何实现阻塞的处理逻辑
+
+	// Block on the channel. Some receiver will complete our operation for us.
+	// 把元素相关信息、当前的G信息打包到一个sudog里，然后扔进send队列
+	gp := getg()
+	mysg := acquireSudog()
+	mysg.releasetime = 0
+	if t0 != 0 {
+		mysg.releasetime = -1
+	}
+	// No stack splits between assigning elem and enqueuing mysg
+	// on gp.waiting where copystack can find it.
+	mysg.elem = ep
+	mysg.waitlink = nil
+	mysg.g = gp // 把当前G也扔进sudog里,用于别人唤醒该G的时候找到该G
+	mysg.selectdone = nil
+	mysg.c = c
+	gp.waiting = mysg // 记录当前G正在等待的sudog
+	gp.param = nil
+	c.sendq.enqueue(mysg)
+	// 切换到g0，把当前G切换到_Gwaiting状态，然后唤醒lock.
+	// 此时当前G被阻塞了,P就继续执行其它G去了.
+	goparkunlock(&c.lock, "chan send", traceEvGoBlockSend, 3)
+
+	......
+	
+	return true
+}
+
+func send(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
+	......
+	
+	gp := sg.g
+	unlockf()
+	gp.param = unsafe.Pointer(sg)
+	if sg.releasetime != 0 {
+		sg.releasetime = cputicks()
+	}
+	goready(gp, skip+1)
+}
+```
+当给一个chan发送消息的时候，实质触发的方法是`chansend`。在该方法里不是先进入休眠状态。
+
+1）如果此时有接收者接收这个chan的消息则直接把数据通过`send`方法扔给接收者，并唤醒接收者的G，然后当前G则继续执行。
+
+2）如果没有接收者，就把数据copy到chan的临时内存里，且内存没有满就继续执行当前G。
+
+3) 如果没有接收者且chan满了，依然是通过`goparkunlock`方法进入休眠。在休眠前把当前的G相关信息存到队列（sendq）以便有接收者接收数据的时候唤醒当前G。
+
+```
+func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool) {
+	......
+	
+	if sg := c.sendq.dequeue(); sg != nil {
+		// Found a waiting sender. If buffer is size 0, receive value
+		// directly from sender. Otherwise, receive from head of queue
+		// and add sender's value to the tail of the queue (both map to
+		// the same buffer slot because the queue is full).
+		// 寻找一个正在等待的sender
+		// 如果buffer size是0，则尝试直接从sender获取(这种情况是在环形队列长度(dataqsiz)为0的时候出现)
+		// 否则(buffer full的时候)从队列head接收，并且帮助sender在队列满时的阻塞的元素信息拷贝到队列里，然后将sender的G状态切换为_Grunning,这样sender就不阻塞了。
+		recv(c, sg, ep, func() { unlock(&c.lock) }, 3)
+		return true, true
+	}
+
+	// 如果有数据则从channel buffer里获取数据后返回(此时环形队列长度dataqsiz!=0)
+	if c.qcount > 0 {
+		// Receive directly from queue
+		qp := chanbuf(c, c.recvx) // 获取即将要读取的chan buffer的指针地址
+		if raceenabled {
+			raceacquire(qp)
+			racerelease(qp)
+		}
+		if ep != nil {
+			typedmemmove(c.elemtype, ep, qp) // copy元素数据内存到channel buffer
+		}
+		typedmemclr(c.elemtype, qp)
+		c.recvx++
+		if c.recvx == c.dataqsiz {
+			c.recvx = 0
+		}
+		c.qcount--
+		unlock(&c.lock)
+		return true, true
+	}
+
+	if !block {
+		unlock(&c.lock)
+		return false, false
+	}
+
+	// ##########下面是无任何数据准备把当前G切换为_Gwaiting状态的逻辑
+
+	// no sender available: block on this channel.
+	gp := getg()
+	mysg := acquireSudog()
+	mysg.releasetime = 0
+	if t0 != 0 {
+		mysg.releasetime = -1
+	}
+	// No stack splits between assigning elem and enqueuing mysg
+	// on gp.waiting where copystack can find it.
+	mysg.elem = ep
+	mysg.waitlink = nil
+	gp.waiting = mysg
+	mysg.g = gp
+	mysg.selectdone = nil
+	mysg.c = c
+	gp.param = nil
+	c.recvq.enqueue(mysg)
+	// 释放了锁，然后把当前G切换为_Gwaiting状态，阻塞在这里等待有数据进来被唤醒
+	goparkunlock(&c.lock, "chan receive", traceEvGoBlockRecv, 3)
+
+	......
+	
+	return true, !closed
+}
+
+func recv(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
+	......
+	
+	sg.elem = nil
+	gp := sg.g
+	unlockf()
+	gp.param = unsafe.Pointer(sg)
+	if sg.releasetime != 0 {
+		sg.releasetime = cputicks()
+	}
+	goready(gp, skip+1)
+}
+```
+`chanrecv`方法是在chan接收者的地方调用的方法。
+
+1）如果有发送者被休眠，则取出数据然后唤醒发送者，当前接收者的G拿到数据继续执行。
+
+2）如果没有等待的发送者就看下有没有发送的数据还没被接收，有的话就直接取出数据然后返回，当前接收者的G拿到数据继续执行。（注意：这里取的数据不是正在等待的sender的数据，而是从chan的开头的内存取，如果是sender的数据则读出来的数据顺序就乱了）
+
+3）如果即没有发送者，chan里也没数据就通过`goparkunlock`进行休眠，在休眠之前把当前的G相关信息存到`recvq`里面，以便有数据时找到要唤醒的G。
+
 ### 网络IO
 
 ### 系统调用
