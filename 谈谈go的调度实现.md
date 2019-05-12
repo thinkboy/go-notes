@@ -6,9 +6,7 @@
 
 -------------------------------------
 
-## 先有个简单的概念
-
-### 调度器的三个概念：G、M、P
+## 调度器的三个抽象概念：G、M、P
 
 * G：代表一个goroutine，每个goroutine都有自己独立的栈存放当前的运行内存及状态。可以把一个G当做一个任务。
 * M: 代表内核线程(Pthread)`，它本身就与一个内核线程进行绑定，goroutine运行在M上。
@@ -20,23 +18,21 @@
 
 ![](images/schedule0.png)
 
-前两个图代表2个有运行任务时的状态。M与一个内核线程绑定，可运行的goroutine列表存放到P里面，然后占用了一个CPU线程来运行。
+图1、图2代表2个有运行任务时的状态。M与一个内核线程绑定，可运行的goroutine列表存放到P里面，然后占用了一个CPU线程来运行。
 
-第三个图代表没有运行任务时的状态，M依然与一个内核线程绑定，由于没有运行任务因此不占用CPU线程，同时也不占用P。
-
-Go的调度也可以看做任务调度的模型。
+图3代表没有运行任务时的状态，M依然与一个内核线程绑定，由于没有运行任务因此不占用CPU线程，同时也不占用P。
 
 ### 调度的大致轮廓
 
 ![](images/schedule3.png)
 
-图中表述了由`go func`触发开始的调度，先创建M通过M启动调度循环，然后调度循环过程中获取G来执行，执行过程中遇到的“主动出让”、“正常完成”、“系统调用”三个case再次进入下一循环。
+图中表述了由`go func`触发的调度。先创建M通过M启动调度循环，然后调度循环过程中获取G来执行，执行过程中遇到图中`running G`后面几个case再次进入下一循环。
 
-下面开始从源码角度详细讨论调度实现。
+**下面从程序启动、调度循环、G的来源三个角度分析调度的实现。**
 
-## 从启动说起，进程启动时都做了什么？
+## 进程启动时都做了什么？
 
-直接进入正题，下面是一段程序启动的代码
+下面先看一段程序启动的代码
 
 ```go
 // runtime/asm_amd64.s
@@ -81,19 +77,19 @@ ok:
         RET
 ```
 
-在启动过程里与调度相关的主要做这几个事情：
+在启动过程里主要做了这三个事情(这里只跟调度相关的)：
 
-* 初始化固定数量的P，准备用于维护运行中以及空闲的G
-* 创建一个新的G来启动`runtime.main`
-* 创建全局M0、全局G0，在最后一步启动M0进入调度循环
+* 初始化固定数量的P
+* 创建一个新的G来启动`runtime.main`,也就是runtime下的main方法
+* 创建全局M0、全局G0，启动M0进入第一个调度循环
 
-M0是什么？程序里会启动多个M，第一个启动的叫M0。
+>M0是什么？程序里会启动多个M，第一个启动的叫M0。
 
-G0是什么？G分三种，第一种是执行用户任务的叫做G，第二种执行runtime下调度工作的叫G0，每个M都绑定一个G0，M0绑定的G0就叫做“全局G0”。第三种则是启动`runtime.main`用到的G。
+>G0是什么？G分三种，第一种是执行用户任务的叫做G，第二种执行runtime下调度工作的叫G0，每个M都绑定一个G0。第三种则是启动`runtime.main`用到的G。写程序接触到的基本都是第一种
 
-我们按照顺序来详细看是怎么完成上面三个事情的。
+我们按照顺序看是怎么完成上面三个事情的。
 
-### `runtime.osinit(SB)`函数针对系统环境的初始化
+### `runtime.osinit(SB)`方法针对系统环境的初始化
 
 这里实质只做了一件事情，就是获取CPU的线程数，也就是Top命令里看到的CPU0、CPU1、CPU2......的数量
 
@@ -131,14 +127,13 @@ if procresize(procs) != nil {
 ```
 这里`sched.maxmcount`设置了M最大的数量，而M代表的是系统内核线程，因此可以认为一个进程最大只能启动10000个系统线程。
 
-`mcommoninit`初始化全局M0。
+`procresize`初始化P的数量，`procs`参数为初始化的数量，而在初始化之前先做数量的判断，默认是`ncpu`(与CPU核数相等)。也可以通过环境变量`GOMAXPROCS`来控制P的数量。`_MaxGomaxprocs`控制了最大的P数量只能是1024。
 
-`procresize`初始化P的数量，`procs`参数为初始化的数量，而在初始化之前先做数量的判断，默认是`ncpu`(与CPU核数相等)，也可以通过环境变量`GOMAXPROCS`来控制P的数量。`_MaxGomaxprocs`控制了最大的P数量只能是1024。
-
-[tip] 我们在进程初始化的时候经常用到`runtime.GOMAXPROCS()`函数，其实也是调用的`procresize`方法重新设置了最大CPU使用数量。
+> 有些人在进程初始化的时候经常用到`runtime.GOMAXPROCS()`方法，其实也是调用的`procresize`方法重新设置了最大CPU使用数量。
 
 ### `runtime·mainPC(SB)`启动监控任务
 ```
+// runtime/proc.go
 
 // The main goroutine.
 func main() {
@@ -152,19 +147,21 @@ func main() {
 	......
 }
 ```
-在runtime下的main方法里跟调度相关的只有一个启动监控任务，该任务用于监控是否有过长时间执行的G，并进行抢占，下面会详细说到。
+在runtime下会启动一个全程运行的监控任务，该任务用于标记抢占执行过长时间的G，以及检测epoll里面是否有可执行的G。下面会详细说到。
 
 ### 最后`runtime·mstart(SB)`启动调度循环
 
-前面都是各种初始化操作，启动调度循环后开始真正的调度逻辑，下面来围绕G、M、P三个概念介绍Goroutine调度的运作流程。(这里启动的M就是第一个处理调度的M，也是M0)
+前面都是各种初始化操作，在这里开启了调度器的第一个调度循环。(这里启动的M就是M0)
 
-## 再看调度循环都做了什么
+下面来围绕G、M、P三个概念介绍Goroutine调度循环的运作流程。
+
+## 调度循环都做了什么
 
 ![](images/schedule.png)
 
-图1代表M启动的过程，把M跟一个P绑定再一起。在程序初始化的过程中说到在进程启动的最后一步启动了第一个M(即M0)，这个M从全局的空闲P列表里拿到一个P，然后与其绑定。而P里面有2个管理G的链表`runq`存储等待运行的G列表，`gfree`存储空闲的G列表，M启动后等待可执行的G。
+图1代表M启动的过程，把M跟一个P绑定再一起。在程序初始化的过程中说到在进程启动的最后一步启动了第一个M(即M0)，这个M从全局的空闲P列表里拿到一个P，然后与其绑定。而P里面有2个管理G的链表(`runq`存储等待运行的G列表，`gfree`存储空闲的G列表)，M启动后等待可执行的G。
 
-图2代表创建G的过程。创建一个G先扔到当前P的`runq`待运行队列里。在图3的执行过程里，M从绑定的P的`runq`列表里获取一个G来执行。当执行完成后，图4的流程里把G仍到`gfree`队列里。注意此时G并没有销毁(只重置了G的栈以及状态)，当再次创建G的时候优先从`gfree`列表里获取，这样就起到了复用G的作用，避免反复与系统交互创建内存。
+图2代表创建G的过程。创建完一个G先扔到当前P的`runq`待运行队列里。在图3的执行过程里，M从绑定的P的`runq`列表里获取一个G来执行。当执行完成后，图4的流程里把G仍到`gfree`队列里。注意此时G并没有销毁(只重置了G的栈以及状态)，当再次创建G的时候优先从`gfree`列表里获取，这样就起到了复用G的作用，避免反复与系统交互创建内存。
 
 M即启动后处于一个自循环状态，执行完一个G之后继续执行下一个G，反复上面的图2~图4过程。当第一个M正在繁忙而又有新的G需要执行时，会再开启一个M来执行。
 
@@ -172,7 +169,7 @@ M即启动后处于一个自循环状态，执行完一个G之后继续执行下
 
 ### 调度器如何开启调度循环
 
-先看一下M的启动过程（M0启动是个特殊的启动过程，由汇编实现的初始化后启动，而普通的M创建以及启动则是Go代码实现）。
+先看一下M的启动过程（M0启动是个特殊的启动过程，也是第一个启动的M，由汇编实现的初始化后启动，而后续的M创建以及启动则是Go代码实现）。
 
 ```
 // runtime/proc.go
@@ -182,18 +179,8 @@ func startm(_p_ *p, spinning bool) {
 	if _p_ == nil {
 		// 从空闲P里获取一个
 		_p_ = pidleget()
-		// 获取失败则终止
-		if _p_ == nil {
-			unlock(&sched.lock)
-			if spinning {
-				// The caller incremented nmspinning, but there are no idle Ps,
-				// so it's okay to just undo the increment and give up.
-				if int32(atomic.Xadd(&sched.nmspinning, -1)) < 0 {
-					throw("startm: negative nmspinning")
-				}
-			}
-			return
-		}
+		
+		......
 	}
 	// 获取一个空闲的m
 	mp := mget()
@@ -208,19 +195,9 @@ func startm(_p_ *p, spinning bool) {
 		newm(fn, _p_)
 		return
 	}
-	if mp.spinning {
-		throw("startm: m is spinning")
-	}
-	if mp.nextp != 0 {
-		throw("startm: m has p")
-	}
-	if spinning && !runqempty(_p_) {
-		throw("startm: p has runnable gs")
-	}
-	// The caller incremented nmspinning, so set m.spinning in the new M.
-	// 设置自璇状态，暂存P
-	mp.spinning = spinning
-	mp.nextp.set(_p_)
+	
+	......
+	
 	// 唤醒M
 	notewakeup(&mp.park)
 }
@@ -287,15 +264,19 @@ func mstart1() {
 	schedule()
 }
 ```
-非M0的启动首先从`startm`方法开始启动，要进行调度工作必须有调度处理器P，因此先从空闲的P里面获取一个P，通过`newm`方法创建一个M与P绑定准备调度。
+非M0的启动首先从`startm`方法开始启动，要进行调度工作必须有调度处理器P，因此先从空闲的P链表里获取一个P，在`newm`方法创建一个M与P绑定。
 
-`newm`方法中通过`newosproc`方法新建一个内核线程，把内核线程与M以及`mstart`方法进行关联，这样内核线程就可以找到M并且同时找到`mstart`方法启动调度工作，并且执行调度任务。注意`allocm`函数创建M的同时创建了一个G与自己关联，这个G就是我们在上面说到的`g0`。为什么M要关联一个g0？因为runtime下执行一个G也需要用到栈空间来完成调度工作，而拥有执行栈的地方只有G，因此需要为每个执行线程里配置一个g0。
+`newm`方法中通过`newosproc`新建一个内核线程，并把内核线程与M以及`mstart`方法进行关联，这样内核线程执行时就可以找到M并且找到启动调度循环的方法。最后`schedule`启动调度循环
+
+>`allocm`方法中创建M的同时创建了一个G与自己关联，这个G就是我们在上面说到的`g0`。为什么M要关联一个g0？因为runtime下执行一个G也需要用到栈空间来完成调度工作，而拥有执行栈的地方只有G，因此需要为每个执行线程里配置一个g0。
 
 ### 调度器如何进行调度循环
 
-内核线程调用`mstart`方法开始执行调度器,最终调用`schedule`进入调度器的调度循环，在这个方法里永远不再返回。
+调用`schedule`进入调度器的调度循环后，在这个方法里永远不再返回。下面看下实现。
 
 ```
+// runtime/proc.go
+
 func schedule() {
 	_g_ := getg()
 
@@ -314,7 +295,7 @@ func schedule() {
 			unlock(&sched.lock)
 		}
 	}
-	// 从本地P队列里取
+	// 从P本地获取
 	if gp == nil {
 		gp, inheritTime = runqget(_g_.m.p.ptr())
 		if gp != nil && _g_.m.spinning {
@@ -326,28 +307,320 @@ func schedule() {
 		gp, inheritTime = findrunnable() // blocks until work is available
 	}
 
-	// This thread is going to run a goroutine and is not spinning anymore,
-	// so if it was marked as spinning we need to reset it now and potentially
-	// start a new spinning M.
-	if _g_.m.spinning {
-		resetspinning()
-	}
-
-	if gp.lockedm != nil {
-		// Hands off own p to the locked m,
-		// then blocks waiting for a new p.
-		startlockedm(gp)
-		goto top
-	}
+	......
+	
 	// 执行找到的G
 	execute(gp, inheritTime)
 }
-```
-`schedule`中首先尝试从P本地队列中获取一个可执行的G，如果没有则从其它地方获取(后面会介绍如何从其它地方获取),最终通过`execute`方法执行找到的可运行的G。
 
-[tip]在这里用到了一个关键方法`getg()`，在runtime的代码里大量使用该函数，它由汇编实现，该方法就是获取当前运行的G，具体实现不再这里阐述。
+// 从P本地获取一个可运行的G
+func runqget(_p_ *p) (gp *g, inheritTime bool) {
+	// If there's a runnext, it's the next G to run.
+	// 优先从runnext里获取一个G，如果没有则从runq里获取
+	for {
+		next := _p_.runnext
+		if next == 0 {
+			break
+		}
+		if _p_.runnext.cas(next, 0) {
+			return next.ptr(), true
+		}
+	}
+
+	// 从队头获取
+	for {
+		h := atomic.Load(&_p_.runqhead) // load-acquire, synchronize with other consumers
+		t := _p_.runqtail
+		if t == h {
+			return nil, false
+		}
+		gp := _p_.runq[h%uint32(len(_p_.runq))].ptr()
+		if atomic.Cas(&_p_.runqhead, h, h+1) { // cas-release, commits consume
+			return gp, false
+		}
+	}
+}
+
+// 从其它地方获取G
+func findrunnable() (gp *g, inheritTime bool) {
+	......
+
+	// 从本地队列获取
+	if gp, inheritTime := runqget(_p_); gp != nil {
+		return gp, inheritTime
+	}
+
+	// 全局队列获取
+	if sched.runqsize != 0 {
+		lock(&sched.lock)
+		gp := globrunqget(_p_, 0)
+		unlock(&sched.lock)
+		if gp != nil {
+			return gp, false
+		}
+	}
+	
+	// 从epoll里取
+	if netpollinited() && sched.lastpoll != 0 {
+		if gp := netpoll(false); gp != nil { // non-blocking
+			......
+			
+			return gp, false
+		}
+	}
+	
+	......
+	
+	// 尝试4次从别的P偷
+	for i := 0; i < 4; i++ {
+		for enum := stealOrder.start(fastrand()); !enum.done(); enum.next() {
+			if sched.gcwaiting != 0 {
+				goto top
+			}
+			stealRunNextG := i > 2 // first look for ready queues with more than 1 g
+			// 在这里开始针对P进行偷取操作
+			if gp := runqsteal(_p_, allp[enum.position()], stealRunNextG); gp != nil {
+				return gp, false
+			}
+		}
+	}
+}
+
+// 尝试从全局runq中获取G
+// 在"sched.runqsize/gomaxprocs + 1"、"max"、"len(_p_.runq))/2"三个数字中取最小的数字作为获取的G数量
+func globrunqget(_p_ *p, max int32) *g {
+	if sched.runqsize == 0 {
+		return nil
+	}
+
+	n := sched.runqsize/gomaxprocs + 1
+	if n > sched.runqsize {
+		n = sched.runqsize
+	}
+	if max > 0 && n > max {
+		n = max
+	}
+	if n > int32(len(_p_.runq))/2 {
+		n = int32(len(_p_.runq)) / 2
+	}
+
+	sched.runqsize -= n
+	if sched.runqsize == 0 {
+		sched.runqtail = 0
+	}
+
+	gp := sched.runqhead.ptr()
+	sched.runqhead = gp.schedlink
+	n--
+	for ; n > 0; n-- {
+		gp1 := sched.runqhead.ptr()
+		sched.runqhead = gp1.schedlink
+		runqput(_p_, gp1, false) // 放到本地P里
+	}
+	return gp
+}
+```
+`schedule`中首先尝试从P本地队列中获取(runqget)一个可执行的G，如果没有则从其它地方获取(findrunnable),最终通过`execute`方法执行G。
+
+`runqget`先通过`runnext`拿到待运行G,没有的话，再从`runq`里面取。
+
+`findrunnable`从全局队列、epoll、别的P里获取。(后面会扩展分析实现)
+
+在调度的开头出还做了一个小优化：每处理一些任务之后，就优先从全局队列里获取任务，以保障公平性，防止由于每个P里的G过多，而全局队列里的任务一直得不到执行机会。
+
+>这里用到了一个关键方法`getg()`，runtime的代码里大量使用该方法，它由汇编实现，该方法就是获取当前运行的G，具体实现不再这里阐述。
+
+### 多个线程下如何调度
+
+**抛出一个问题：每个P里面的G执行时间是不可控的，如果多个P同时在执行，会不会出现有的P里面的G执行不完，有的P里面几乎没有G可执行呢？**
+
+这就要从M的自循环过程中如何获取G、归还G的行为说起了，先看图：
+
+![](images/schedule2.png)
+
+图中可以看出有两种途径：1.借助全局队列`sched.runq`作为中介，本地P里的G太多的话就放全局里，G太少的话就从全局取。2.全局列表里没有的话直接从P1里偷取(steal)。(更多M在执行的话，同样的原理，这里就只拿2个来举例)
+
+**第1种途径实现如下：**
 
 ```
+// runtime/proc.go
+
+func runqput(_p_ *p, gp *g, next bool) {
+	if randomizeScheduler && next && fastrand()%2 == 0 {
+		next = false
+	}
+
+	// 尝试把G添加到P的runnext节点，这里确保runnext只有一个G，如果之前已经有一个G则踢出来放到runq里
+	if next {
+	retryNext:
+		oldnext := _p_.runnext
+		if !_p_.runnext.cas(oldnext, guintptr(unsafe.Pointer(gp))) {
+			goto retryNext
+		}
+		if oldnext == 0 {
+			return
+		}
+		// 把老的g踢出来，在下面放到runq里
+		gp = oldnext.ptr()
+	}
+
+retry:
+	// 如果_p_.runq队列不满，则放到队尾就结束了。
+	// 试想如果不放到队尾而放到队头里会怎样？如果频繁的创建G则可能后面的G总是不被执行，对后面的G不公平
+	h := atomic.Load(&_p_.runqhead) // load-acquire, synchronize with consumers
+	t := _p_.runqtail
+	if t-h < uint32(len(_p_.runq)) {
+		_p_.runq[t%uint32(len(_p_.runq))].set(gp)
+		atomic.Store(&_p_.runqtail, t+1) // store-release, makes the item available for consumption
+		return
+	}
+	//如果队列满了，尝试把G和当前P里的一部分runq放到全局队列
+	//因为操作全局需要加锁,所以名字里带个slow
+	if runqputslow(_p_, gp, h, t) {
+		return
+	}
+	// the queue is not full, now the put above must succeed
+	goto retry
+}
+
+func runqputslow(_p_ *p, gp *g, h, t uint32) bool {
+	var batch [len(_p_.runq)/2 + 1]*g
+
+	// First, grab a batch from local queue.
+	n := t - h
+	n = n / 2
+	if n != uint32(len(_p_.runq)/2) {
+		throw("runqputslow: queue is not full")
+	}
+	// 从runq头部开始取出一半的runq放到临时变量batch里
+	for i := uint32(0); i < n; i++ {
+		batch[i] = _p_.runq[(h+i)%uint32(len(_p_.runq))].ptr()
+	}
+	if !atomic.Cas(&_p_.runqhead, h, h+n) { // cas-release, commits consume
+		return false
+	}
+	// 把要put的g也放进batch去
+	batch[n] = gp
+
+	if randomizeScheduler {
+		for i := uint32(1); i <= n; i++ {
+			j := fastrandn(i + 1)
+			batch[i], batch[j] = batch[j], batch[i]
+		}
+	}
+
+	// 把取出来的一半runq组成链表
+	for i := uint32(0); i < n; i++ {
+		batch[i].schedlink.set(batch[i+1])
+	}
+
+	// 将一半的runq放到global队列里,一次多转移一些省得转移频繁
+	lock(&sched.lock)
+	globrunqputbatch(batch[0], batch[n], int32(n+1))
+	unlock(&sched.lock)
+	return true
+}
+
+func globrunqputbatch(ghead *g, gtail *g, n int32) {
+	gtail.schedlink = 0
+	if sched.runqtail != 0 {
+		sched.runqtail.ptr().schedlink.set(ghead)
+	} else {
+		sched.runqhead.set(ghead)
+	}
+	sched.runqtail.set(gtail)
+	sched.runqsize += n
+}
+```
+`runqput`方法归还执行完的G,`runq`定义是`runq [256]guintptr`，有固定的长度，因此当前P里的待运行G超过256的时候说明过多了，则执行`runqputslow`方法把一半G扔给全局G链表，`globrunqputbatch`连接全局链表的头尾指针。
+
+但可能别的P里面并没有超过256，就不会放到全局G链表里，甚至可能一直维持在不到256个。这就借助第2个途径了：
+
+**第2种途径实现如下：**
+
+```
+// runtime/proc.go
+
+// 从其它地方获取G
+func findrunnable() (gp *g, inheritTime bool) {
+	......
+	
+	// 尝试4次从别的P偷
+	for i := 0; i < 4; i++ {
+		for enum := stealOrder.start(fastrand()); !enum.done(); enum.next() {
+			if sched.gcwaiting != 0 {
+				goto top
+			}
+			stealRunNextG := i > 2 // first look for ready queues with more than 1 g
+			// 在这里开始针对P进行偷取操作
+			if gp := runqsteal(_p_, allp[enum.position()], stealRunNextG); gp != nil {
+				return gp, false
+			}
+		}
+	}
+}
+```
+从别的P里面"偷取"一些G过来执行了。`runqsteal`方法实现了"偷取"操作。
+
+```
+// runtime/proc.go
+
+// 偷取P2一半到本地运行队列，失败则返回nil
+func runqsteal(_p_, p2 *p, stealRunNextG bool) *g {
+	t := _p_.runqtail
+	n := runqgrab(p2, &_p_.runq, t, stealRunNextG)
+	if n == 0 {
+		return nil
+	}
+	n--
+	// 返回尾部的一个G
+	gp := _p_.runq[(t+n)%uint32(len(_p_.runq))].ptr()
+	if n == 0 {
+		return gp
+	}
+	h := atomic.Load(&_p_.runqhead) // load-acquire, synchronize with consumers
+	if t-h+n >= uint32(len(_p_.runq)) {
+		throw("runqsteal: runq overflow")
+	}
+	atomic.Store(&_p_.runqtail, t+n) // store-release, makes the item available for consumption
+	return gp
+}
+
+// 从P里获取一半的G,放到batch里
+func runqgrab(_p_ *p, batch *[256]guintptr, batchHead uint32, stealRunNextG bool) uint32 {
+	for {
+		// 计算一半的数量
+		h := atomic.Load(&_p_.runqhead) // load-acquire, synchronize with other consumers
+		t := atomic.Load(&_p_.runqtail) // load-acquire, synchronize with the producer
+		n := t - h
+		n = n - n/2
+		
+		......
+		
+		// 将偷到的任务转移到本地P队列里
+		for i := uint32(0); i < n; i++ {
+			g := _p_.runq[(h+i)%uint32(len(_p_.runq))]
+			batch[(batchHead+i)%uint32(len(batch))] = g
+		}
+		if atomic.Cas(&_p_.runqhead, h, h+n) { // cas-release, commits consume
+			return n
+		}
+	}
+}
+```
+上面可以看出从别的P里面偷(steal)了一半，这样就足够运行了。有了“偷取”操作也就充分利用了多线程的资源。
+
+## 调度循环中如何让出CPU
+
+### 正常完成让出CPU
+
+绝大多数场景下我们程序都是执行完一个G，再执行另一个G，那我们就看下G是如何被执行以及执行完如何退出的。
+
+先看G如何被执行：
+
+```
+// runtime/proc.go
+
 func execute(gp *g, inheritTime bool) {
 	_g_ := getg()
 
@@ -355,7 +628,7 @@ func execute(gp *g, inheritTime bool) {
 	
 	......
 
-	// 真正的执行g（汇编实现）
+	// 真正的执行G，切换到该G的栈帧上执行（汇编实现）
 	gogo(&gp.sched)
 }
 ```
@@ -390,7 +663,7 @@ nilctxt: // 下面则是函数栈的BP SP指针移动，最后进入到指定的
         MOVQ    $0, gobuf_ret(BX) 
         MOVQ    $0, gobuf_ctxt(BX)
         MOVQ    $0, gobuf_bp(BX)
-        MOVQ    gobuf_pc(BX), BX // PC指针即返回地址
+        MOVQ    gobuf_pc(BX), BX // PC指针指向退出时要执行的函数地址
         JMP     BX  // 跳转到执行代码处
 ```
 ```
@@ -416,11 +689,86 @@ type gobuf struct {
 	bp   uintptr // for GOEXPERIMENT=framepointer
 }
 ```
-`gogo`方法传的参数注意是`gp.sched`,而这个结构体里可以看到保存了熟悉的`SP/PC/BP`指针，能想象到是把执行栈传了进去(既然是执行一个G，当然要把执行栈传进去了)。可以看到在`gogo`函数中实质就只是做了函数栈指针的移动。
+`gogo`方法传的参数注意是`gp.sched`,而这个结构体里可以看到保存了熟悉的函数栈寄存器`SP/PC/BP`，能想到是把执行栈传了进去(既然是执行一个G，当然要把执行栈传进去了)。可以看到在`gogo`函数中实质就只是做了函数栈指针的移动。
 
-### 调度循环中如何上下文切换
+这个执行G的操作，熟悉**函数调用的函数栈**的基本原理的人想必有些印象(如果不熟悉请自行搜索)，执行一个G其实就是执行函数一样切换到对应的函数栈帧上。
 
-上面介绍的是调度中执行G的过程，那G和G之间的切换又是怎么完成的？在runtime下面有个`gopark`方法来完成切换，直接看代码。
+C语言里栈帧创建的时候有个IP寄存器指向"return address",即主调函数的一条指令的地址， 被调函数退出的时候通过该指针回到调用函数里。在Go语言里有个PC寄存器指向退出函数。那么下PC寄存器指向的是哪里？我们回到创建G的地方看下代码：
+
+```
+// runtime/proc.go
+
+func newproc1(fn *funcval, argp *uint8, narg int32, nret int32, callerpc uintptr) *g {
+	......
+	
+	// 从当前P里面复用一个空闲G
+	newg := gfget(_p_)
+	// 如果没有空闲G则新建一个,默认堆大小为_StackMin=2048 bytes
+	if newg == nil {
+		newg = malg(_StackMin)
+		casgstatus(newg, _Gidle, _Gdead)
+		// 把新创建的G添加到全局allg里
+		allgadd(newg) // publishes with a g->status of Gdead so GC scanner doesn't look at uninitialized stack.
+	}
+	
+	......
+	
+	newg.sched.sp = sp
+	newg.stktopsp = sp
+	newg.sched.pc = funcPC(goexit) + sys.PCQuantum // 记录当前任务的pc寄存器为goexit方法，用于当执行G结束后找到退出方法，从而再次进入调度循环 // +PCQuantum so that previous instruction is in same function
+	newg.sched.g = guintptr(unsafe.Pointer(newg))
+	gostartcallfn(&newg.sched, fn)
+	newg.gopc = callerpc
+	newg.startpc = fn.fn
+	
+	.......
+	
+	return newg
+}
+```
+代码中可以看到，给G的执行环境里的pc变量赋值了一个`goexit`的函数地址，也就是说G正常执行完退出时执行的是goexit函数。再看下该函数的实现:
+
+```
+// runtime/asm_amd64.s
+
+// The top-most function running on a goroutine
+// returns to goexit+PCQuantum.
+TEXT runtime·goexit(SB),NOSPLIT,$0-0
+	BYTE	$0x90	// NOP
+	CALL	runtime·goexit1(SB)	// does not return
+	// traceback from goexit1 must hit code range of goexit
+	BYTE	$0x90	// NOP
+```
+```
+// runtime/proc.go
+
+// G执行结束后回到这里放到P的本地队列里
+func goexit1() {
+	if raceenabled {
+		racegoend()
+	}
+	if trace.enabled {
+		traceGoEnd()
+	}
+	// 切换到g0来释放G
+	mcall(goexit0)
+}
+
+// g0下当G执行结束后回到这里放到P的本地队列里
+func goexit0(gp *g) {
+	......
+
+	gfput(_g_.m.p.ptr(), gp)
+	schedule()
+}
+```
+代码中切换到了G0下执行了`schedule`方法，再次进度了下一轮调度循环。
+
+以上就是正常执行一个G并正常退出的实现。
+
+### 主动让出CPU
+
+在实际场景中还有一些没有执行完成的G，而又需要临时停止执行，比如`time.Sleep`、IO阻塞等等，就需要挂起该G，把CPU让出给别人使用。在runtime下面有个`gopark`方法，看下实现：
 
 ```
 // runtime/proc.go
@@ -485,218 +833,13 @@ func park_m(gp *g) {
 ```
 `gopark`是进行调度出让CPU资源的方法，里面有个方法`mcall()`，注释里这样描述：
 
-* 从当前运行的G切换到g0的运行栈上，然后调用fn(g)，这里被调用的g是调用mcall方法时的G。`mcall`函数保存当前运行的G的 PC/SP 到 g->sched 里，因此该G可以在以后被重新恢复执行.
+>从当前运行的G切换到g0的运行栈上，然后调用fn(g)，这里被调用的G是调用mcall方法时的G。`mcall`方法保存当前运行的G的 PC/SP 到 g->sched 里，因此该G可以在以后被重新恢复执行.
 
-在本章开始介绍初始化过程中有提到M启动的时候绑定了一个g0，调度工作是运行在g0的栈上的，`mcall`方法就是此时用到的这个g0。它的做法是先把当前调用的G的执行栈暂存到`g->sched`变量里，然后切换到g0的执行栈上开始进行调度工作。注释里说的fn(g)也就是`park_m(gp *g)`方法，所以进入到`park_m`方法里其实也进入到了g0的执行栈里了，参数 gp 就是当前执行`mall`的G，方法里把gp的状态从`_Grunning`切换到`_Gwaiting`表明进入到等待唤醒状态，此时休眠G的操作就完成了。接下来既然休眠了G了，CPU线程总不能闲下来，在`park_m`方法里又可以看到`schedule`方法，开始进入到调度循环了。
+在本章开始介绍初始化过程中有提到M创建的时候绑定了一个g0，调度工作是运行在g0的栈上的。`mcall`方法通过g0先把当前调用的G的执行栈暂存到 g->sched 变量里，然后切换到g0的执行栈上执行`park_m`。`park_m`方法里把gp的状态从 _Grunning 切换到 _Gwaiting 表明进入到等待唤醒状态，此时休眠G的操作就完成了。接下来既然G休眠了，CPU线程总不能闲下来，在`park_m`方法里又可以看到`schedule`方法，开始进入到到一轮调度循环了。
 
-`park_m`方法里还有段小插曲，进入调度循环之前还有个对`waitunlockf`方法的判断，该方法意思是如果解锁不成功则调用`execute`方法继续执行之前的G，而该方法永远不会return，也就不会再次进入下一次调度。也就是说给外层一个控制是否要进行下一个调度的选择。
+>`park_m`方法里还有段小插曲，进入调度循环之前还有个对`waitunlockf`方法的判断，该方法意思是如果解锁不成功则调用`execute`方法继续执行之前的G，而该方法永远不会return，也就不会再次进入下一次调度。也就是说给外部一个控制是否要进行下一个调度的选择。
 
-### 多个线程下如何均衡负载
-
-**抛出一个问题：每个P里面的G执行时间是不可控的，如果多个P同时在执行，会不会出现有的P里面的G执行不完，有的P里面几乎没有G可执行呢？**
-
-这就要从M的自循环过程中如何获取G、归还G的行为说起了，先看图：
-
-![](images/schedule2.png)
-
-图中可以看出有两种途径：1.借助全局队列`sched.runq`作为中介，本地P里的G太多的话就放全局里，G太少的话就从全局取。2.全局列表里没有的话直接从P1里偷取(steal)。(更多M在执行的话，同样的原理，这里就只拿2个来举例)
-
-**第1种途径实现如下：**
-
-```
-// runtime/proc.go
-
-func runqput(_p_ *p, gp *g, next bool) {
-	if randomizeScheduler && next && fastrand()%2 == 0 {
-		next = false
-	}
-
-	// 尝试把G添加到P的runnext节点，这里确保runnext只有一个G，如果之前已经有一个G则踢出来放到runq里
-	if next {
-	retryNext:
-		oldnext := _p_.runnext
-		if !_p_.runnext.cas(oldnext, guintptr(unsafe.Pointer(gp))) {
-			goto retryNext
-		}
-		if oldnext == 0 {
-			return
-		}
-		// 把老的g踢出来，在下面放到runq里
-		gp = oldnext.ptr()
-	}
-
-retry:
-	// 如果_p_.runq队列不满，则放到队尾就结束了。
-	// 试想如果不放到队尾而放到队头里会怎样？如果频繁的创建G则可能后面的G总是不被执行，对后面的G不公平
-	h := atomic.Load(&_p_.runqhead) // load-acquire, synchronize with consumers
-	t := _p_.runqtail
-	if t-h < uint32(len(_p_.runq)) {
-		_p_.runq[t%uint32(len(_p_.runq))].set(gp)
-		atomic.Store(&_p_.runqtail, t+1) // store-release, makes the item available for consumption
-		return
-	}
-	//如果队列满了，尝试把G和当前P里的一部分runq放到全局队列
-	//因为操作全局需要加锁,所以名字里带个slow
-	if runqputslow(_p_, gp, h, t) {
-		return
-	}
-	// the queue is not full, now the put above must succeed
-	goto retry
-}
-```
-```
-// runtime/proc.go
-
-func runqputslow(_p_ *p, gp *g, h, t uint32) bool {
-	var batch [len(_p_.runq)/2 + 1]*g
-
-	// First, grab a batch from local queue.
-	n := t - h
-	n = n / 2
-	if n != uint32(len(_p_.runq)/2) {
-		throw("runqputslow: queue is not full")
-	}
-	// 从runq头部开始取出一半的runq放到临时变量batch里
-	for i := uint32(0); i < n; i++ {
-		batch[i] = _p_.runq[(h+i)%uint32(len(_p_.runq))].ptr()
-	}
-	if !atomic.Cas(&_p_.runqhead, h, h+n) { // cas-release, commits consume
-		return false
-	}
-	// 把要put的g也放进batch去
-	batch[n] = gp
-
-	// 注释说在竞争检测中为了避免不规范的测试和潜在的假设,所以随机，不明白潜在的假设是指什么,似乎是一种没想清楚的绕过问题的逻辑
-	if randomizeScheduler {
-		for i := uint32(1); i <= n; i++ {
-			j := fastrandn(i + 1)
-			batch[i], batch[j] = batch[j], batch[i]
-		}
-	}
-
-	// 把取出来的一半runq组成链表
-	for i := uint32(0); i < n; i++ {
-		batch[i].schedlink.set(batch[i+1])
-	}
-
-	// 将一半的runq放到global队列里,一次多转移一些省得转移频繁
-	lock(&sched.lock)
-	globrunqputbatch(batch[0], batch[n], int32(n+1))
-	unlock(&sched.lock)
-	return true
-}
-```
-```
-// runtime/proc.go
-
-func globrunqputbatch(ghead *g, gtail *g, n int32) {
-	gtail.schedlink = 0
-	if sched.runqtail != 0 {
-		sched.runqtail.ptr().schedlink.set(ghead)
-	} else {
-		sched.runqhead.set(ghead)
-	}
-	sched.runqtail.set(gtail)
-	sched.runqsize += n
-}
-```
-`runqput`方法归还执行完的G,`runq`定义是`runq [256]guintptr`，有固定的长度，因此当前P里的待运行G超过256的时候说明过多了，则执行`runqputslow`方法把一半G扔给全局G链表，`globrunqputbatch`连接全局链表的头尾指针。
-
-上面介绍的是归还过程，获取则是一样的反向流程先从本地取，本地没有的话就从全局里取，这里就不多说了。
-
-**第2种途径实现如下：**
-
-```
-// runtime/proc.go
-
-func findrunnable() (gp *g, inheritTime bool) {
-
-	......
-
-	// 从本地队列获取
-	if gp, inheritTime := runqget(_p_); gp != nil {
-		return gp, inheritTime
-	}
-
-	// 全局队列获取
-	if sched.runqsize != 0 {
-		lock(&sched.lock)
-		gp := globrunqget(_p_, 0)
-		unlock(&sched.lock)
-		if gp != nil {
-			return gp, false
-		}
-	}
-	
-	......
-	
-	// 尝试4次从别的P偷
-	for i := 0; i < 4; i++ {
-		for enum := stealOrder.start(fastrand()); !enum.done(); enum.next() {
-			if sched.gcwaiting != 0 {
-				goto top
-			}
-			stealRunNextG := i > 2 // first look for ready queues with more than 1 g
-			// 在这里开始针对P进行偷取操作
-			if gp := runqsteal(_p_, allp[enum.position()], stealRunNextG); gp != nil {
-				return gp, false
-			}
-		}
-	}
-```
-
-但可能别的P里面并没有超过256，就不会放到全局G链表里，甚至可能一直维持在不到256个。这就借助第2个途径了：从别的P里面"偷取"一些G过来执行了。`runqsteal`方法实现了"偷取"操作。
-
-```
-// runtime/proc.go
-
-func runqsteal(_p_, p2 *p, stealRunNextG bool) *g {
-	t := _p_.runqtail
-	n := runqgrab(p2, &_p_.runq, t, stealRunNextG)
-	if n == 0 {
-		return nil
-	}
-	n--
-	// 返回尾部的一个G
-	gp := _p_.runq[(t+n)%uint32(len(_p_.runq))].ptr()
-	if n == 0 {
-		return gp
-	}
-	h := atomic.Load(&_p_.runqhead) // load-acquire, synchronize with consumers
-	if t-h+n >= uint32(len(_p_.runq)) {
-		throw("runqsteal: runq overflow")
-	}
-	atomic.Store(&_p_.runqtail, t+n) // store-release, makes the item available for consumption
-	return gp
-}
-```
-```
-// runtime/proc.go
-
-func runqgrab(_p_ *p, batch *[256]guintptr, batchHead uint32, stealRunNextG bool) uint32 {
-	for {
-		// 计算一半的数量
-		h := atomic.Load(&_p_.runqhead) // load-acquire, synchronize with other consumers
-		t := atomic.Load(&_p_.runqtail) // load-acquire, synchronize with the producer
-		n := t - h
-		n = n - n/2
-		
-		......
-		
-		// 将偷到的任务转移到本地P队列里
-		for i := uint32(0); i < n; i++ {
-			g := _p_.runq[(h+i)%uint32(len(_p_.runq))]
-			batch[(batchHead+i)%uint32(len(batch))] = g
-		}
-		if atomic.Cas(&_p_.runqhead, h, h+n) { // cas-release, commits consume
-			return n
-		}
-	}
-}
-```
-上面可以看出从别的P里面偷(steal)了一半，这样就足够运行了。有了“偷取”操作也就充分利用多线程的资源。
-
-### G执行时间过长如何抢占
+### 抢占让出CPU
 
 回想在`runtime.main()`里面有单独启动了一个监控任务，方法是`sysmon`。看下该方法：
 
@@ -719,7 +862,20 @@ func sysmon() {
 		}
 		usleep(delay)
 		
-		......
+		lastpoll := int64(atomic.Load64(&sched.lastpoll))
+		now := nanotime()
+		if lastpoll != 0 && lastpoll+10*1000*1000 < now {
+			atomic.Cas64(&sched.lastpoll, uint64(lastpoll), uint64(now))
+			gp := netpoll(false) // non-blocking - returns list of goroutines
+			if gp != nil {
+				......
+				
+				incidlelocked(-1)
+				// 把epoll ready的G列表注入到全局runq里
+				injectglist(gp)
+				incidlelocked(1)
+			}
+		}
 		
 		// retake P's blocked in syscalls
 		// and preempt long running G's
@@ -788,7 +944,7 @@ func preemptone(_p_ *p) bool {
 	return true
 }
 ```
-`sysmon()`方法处于无限for循环，整个进程的生命周期监控着。`retake()`方法每次对所有的P遍历检查是否超过10ms的还在运行的执行器(P)，如果有超过10ms的则通过`preemptone()`进行抢占，但是要注意看这个方法的实现，其实并没有做什么实质的停止运行操作，而只是做了个抢占的标记，唯一的一个操作就是给gp.stackguard0赋值了一个`stackPreempt`，因此这里的抢占实质只是一个标记抢占。那么真正停止P执行的操作在哪里？
+`sysmon()`方法处于无限for循环，整个进程的生命周期监控着。`retake()`方法每次对所有的P遍历检查超过10ms的还在运行的G，如果有超过10ms的则通过`preemptone()`进行抢占，但是要注意这里只把gp.stackguard0赋值了一个`stackPreempt`，并没有做让出CPU的操作，因此这里的抢占实质只是一个”标记“抢占。那么真正停止G执行的操作在哪里？
 
 ```
 // runtime/stack.go
@@ -836,9 +992,125 @@ func goschedImpl(gp *g) {
 	schedule()
 }
 ```
-我们都知道Go的调度是非抢占式的，要想实现G不被长时间，就只能主动触发抢占，而Go触发抢占的实际就是栈扩张的时候，在`newstack`新创建栈空间的时候检测是否有抢占标记，如果有则通过`goschedImpl`方法再次进入到熟悉的`schedule`调度循环。判断是否抢占的标记就是判断`gp.stackguard0`是否等于`stackPreempt`。
+我们都知道Go的调度是非抢占式的，要想实现G不被长时间，就只能主动触发抢占，而Go触发抢占的实际就是在栈扩张的时候，在`newstack`新创建栈空间的时候检测是否有抢占标记(也就是`gp.stackguard0`是否等于`stackPreempt`)，如果有则通过`goschedImpl`方法再次进入到熟悉的`schedule`调度循环。
 
-### G如何进入调度器的调度循环
+### 系统调用让出CPU
+
+我们程序都跑在系统上面，就绕不开与系统的交互。那么当我们的Go程序做系统调用的时候，系统的方法不确定会阻塞多久，而我们程序又不知道运行的状态该怎么办？
+
+在Go中并没有直接对系统内核函数调用，而是封装了个`syscall.Syscall`方法，先看下实现：
+
+```
+// syscall/syscall_unix.go
+
+func Syscall(trap, a1, a2, a3 uintptr) (r1, r2 uintptr, err Errno)
+```
+```
+// syscall/asm_linux_amd64.s
+
+TEXT	·Syscall(SB),NOSPLIT,$0-56
+	CALL	runtime·entersyscall(SB) 
+	MOVQ	a1+8(FP), DI
+	MOVQ	a2+16(FP), SI
+	MOVQ	a3+24(FP), DX
+	MOVQ	$0, R10
+	MOVQ	$0, R8
+	MOVQ	$0, R9
+	MOVQ	trap+0(FP), AX	// syscall entry
+	SYSCALL // 进行系统调用
+	CMPQ	AX, $0xfffffffffffff001
+	JLS	ok
+	MOVQ	$-1, r1+32(FP)
+	MOVQ	$0, r2+40(FP)
+	NEGQ	AX
+	MOVQ	AX, err+48(FP)
+	CALL	runtime·exitsyscall(SB)
+	RET
+ok:
+	MOVQ	AX, r1+32(FP)
+	MOVQ	DX, r2+40(FP)
+	MOVQ	$0, err+48(FP)
+	CALL	runtime·exitsyscall(SB)
+	RET
+```
+在汇编代码中看出先是执行了`runtime·entersyscall`方法，然后进行系统调用，最后执行了`runtime·exitsyscall(SB)`，从字面意思看是进入系统调用之前先执行一些逻辑，退出系统调用之后执行一堆逻辑。看下具体实现：
+
+```
+// runtime/proc.go
+
+func entersyscall(dummy int32) {
+	reentersyscall(getcallerpc(unsafe.Pointer(&dummy)), getcallersp(unsafe.Pointer(&dummy)))
+}
+
+func reentersyscall(pc, sp uintptr) {
+	......
+	
+	// Leave SP around for GC and traceback.
+	// 保存执行现场
+	save(pc, sp)
+	_g_.syscallsp = sp
+	_g_.syscallpc = pc
+	// 切换到系统调用状态
+	casgstatus(_g_, _Grunning, _Gsyscall)
+	
+	......
+	
+	// Goroutines must not split stacks in Gsyscall status (it would corrupt g->sched).
+	// We set _StackGuard to StackPreempt so that first split stack check calls morestack.
+	// Morestack detects this case and throws.
+	_g_.stackguard0 = stackPreempt
+	_g_.m.locks--
+}
+```
+进入系统调用前先保存执行现场，然后切换到`_Gsyscall`状态，最后标记抢占，等待被抢占走。
+
+```
+// runtime/proc.go
+
+func exitsyscall(dummy int32) {
+	......
+
+	// Call the scheduler.
+	mcall(exitsyscall0)
+
+	......
+}
+
+func exitsyscall0(gp *g) {
+	_g_ := getg()
+
+	casgstatus(gp, _Gsyscall, _Grunnable)
+	dropg()
+	lock(&sched.lock)
+	// 获取一个空闲的P，如果没有则放到全局队列里，如果有则执行
+	_p_ := pidleget()
+	if _p_ == nil {
+		globrunqput(gp) // 如果没有P就放到全局队列里,等待有资源时执行
+	} else if atomic.Load(&sched.sysmonwait) != 0 {
+		atomic.Store(&sched.sysmonwait, 0)
+		notewakeup(&sched.sysmonnote)
+	}
+	unlock(&sched.lock)
+	if _p_ != nil {
+		acquirep(_p_)
+		execute(gp, false) // Never returns. // 如果找到空闲的P则直接执行
+	}
+	if _g_.m.lockedg != nil {
+		// Wait until another thread schedules gp and so m again.
+		stoplockedm()
+		execute(gp, false) // Never returns.
+	}
+	stopm()
+	schedule() // Never returns. // 没有P资源执行，就继续下一轮调度循环
+}
+```
+系统调用退出时，切到G0下把G状态切回来，如果有可执行的P则直接执行，如果没有则放到全局队列里，等待调度，最后又看到了熟悉的`schedule`进入下一轮调度循环。
+
+# 待执行G的来源
+
+### `go func`正常创建G
+
+当开启一个Goroutine的时候用到`go func()`这样的语法，在runtime下其实调用的就是`newproc`方法。
 
 ```
 // runtime/proc.go
@@ -888,12 +1160,152 @@ func newproc1(fn *funcval, argp *uint8, narg int32, nret int32, callerpc uintptr
 	return newg
 }
 ```
+`newproc1`方法中`gfget`先从空闲的G列表获取一个G对象，没有则创建一个新的G对象，然后`runqput`放到当前P待运行队列里。
 
-当开启一个Goroutine的时候用到`go func()`这样的语法，在runtime下其实调用的就是`newproc`方法，实质实现是`newproc1`,在该方法中`gfget`先从空闲的G列表获取一个G，最后`runqput`放到当前P待运行队列里。
+### epoll来源
 
-总结：到这里调度器的调度过程介绍基本完成了。光有了调度器的实现以及调度流程似乎并不能很好的理解调度原理。下面拿几个常见应用场景看如何利用这个调度器的。
+回想上面分析**抢占**以及**多线程下如何调度**时都见到一个`netpoll`方法，这个方法就是从系统内核获取已经有数据的时间，然后映射到对应的G标记ready。下面看实现：
 
-## 看几个调度相关的场景
+```
+// runtime/proc.go
+
+func netpoll(block bool) *g {
+	......
+	var events [128]epollevent
+retry:
+	n := epollwait(epfd, &events[0], int32(len(events)), waitms)
+	if n < 0 {
+		if n != -_EINTR {
+			println("runtime: epollwait on fd", epfd, "failed with", -n)
+			throw("runtime: netpoll failed")
+		}
+		goto retry
+	}
+	var gp guintptr
+	for i := int32(0); i < n; i++ {
+		ev := &events[i]
+		if ev.events == 0 {
+			continue
+		}
+		var mode int32
+		if ev.events&(_EPOLLIN|_EPOLLRDHUP|_EPOLLHUP|_EPOLLERR) != 0 {
+			mode += 'r'
+		}
+		if ev.events&(_EPOLLOUT|_EPOLLHUP|_EPOLLERR) != 0 {
+			mode += 'w'
+		}
+		if mode != 0 {
+			pd := *(**pollDesc)(unsafe.Pointer(&ev.data))
+
+			netpollready(&gp, pd, mode)
+		}
+	}
+	if block && gp == 0 {
+		goto retry
+	}
+	return gp.ptr()
+}
+
+func netpollready(gpp *guintptr, pd *pollDesc, mode int32) {
+	var rg, wg guintptr
+	if mode == 'r' || mode == 'r'+'w' {
+		rg.set(netpollunblock(pd, 'r', true))
+	}
+	if mode == 'w' || mode == 'r'+'w' {
+		wg.set(netpollunblock(pd, 'w', true))
+	}
+	if rg != 0 {
+		rg.ptr().schedlink = *gpp
+		*gpp = rg
+	}
+	if wg != 0 {
+		wg.ptr().schedlink = *gpp
+		*gpp = wg
+	}
+}
+
+// 解锁pd wait状态,标记为pdReady，并返回
+func netpollunblock(pd *pollDesc, mode int32, ioready bool) *g {
+	gpp := &pd.rg
+	if mode == 'w' {
+		gpp = &pd.wg
+	}
+
+	for {
+		old := *gpp
+		if old == pdReady {
+			return nil
+		}
+		if old == 0 && !ioready {
+			// Only set READY for ioready. runtime_pollWait
+			// will check for timeout/cancel before waiting.
+			return nil
+		}
+		var new uintptr
+		if ioready {
+			new = pdReady
+		}
+		// 变量pd.rg在netpollblock的时候已经指向了运行pd的G,因此old其实指向G的指针，而不是pdWait等等的状态指针了
+		if atomic.Casuintptr(gpp, old, new) {
+			if old == pdReady || old == pdWait {
+				old = 0
+			}
+			return (*g)(unsafe.Pointer(old))
+		}
+	}
+}
+```
+首先`epollwait`从内核获取到一批event，也就拿到了有收到就绪的FD。`netpoll`的返回值是一个G链表，在该方法里只是把要被唤醒的G标记ready，然后交给外部处理，例如`sysmon`中的代码：
+
+```
+// runtime/proc.go
+
+func sysmon() {
+	......
+	
+	for {
+		......
+		
+		lastpoll := int64(atomic.Load64(&sched.lastpoll))
+		now := nanotime()
+		if lastpoll != 0 && lastpoll+10*1000*1000 < now {
+			atomic.Cas64(&sched.lastpoll, uint64(lastpoll), uint64(now))
+			gp := netpoll(false) // non-blocking - returns list of goroutines
+			if gp != nil {
+				......
+				
+				incidlelocked(-1)
+				// 把epoll ready的G列表注入到全局runq里
+				injectglist(gp)
+				incidlelocked(1)
+			}
+		}
+		
+		......
+	}
+}
+
+// 把G列表注入到全局runq里
+func injectglist(glist *g) {
+	......
+	
+	lock(&sched.lock)
+	var n int
+	for n = 0; glist != nil; n++ {
+		gp := glist
+		glist = gp.schedlink.ptr()
+		casgstatus(gp, _Gwaiting, _Grunnable)
+		globrunqput(gp)
+	}
+	
+	......
+}
+```
+`netpoll`返回的链表交给了`injectglist`，然后其实是放到了全局rung队列中，等待被调度。
+
+>epoll内容较多，本章主要围绕调度的话题讨论，在这里就不展开分析。
+
+# 看几个主动让出CPU的场景
 
 ### time.Sleep
 
@@ -1012,7 +1424,7 @@ func timerproc() {
 	}
 }
 ```
-在`addtimerLocked`方法的最下面有个逻辑在运行期间开启了'全局时间事件驱动器'`timerproc`,该方法会不断的遍历最小堆，寻找最早进入timer管理器的定时器，然后唤醒。他是怎么找到要唤醒哪个G的？回头看下`timeSleep`方法里把当时正在执行的G以及唤醒方法`goroutineReady`带到了每个定时器里，而在`timerproc`则通过找到期的定时器执行`f(arg, seq)`
+在`addtimerLocked`方法的最下面有个逻辑在运行期间开启了'全局时间事件驱动器'`timerproc`,该方法会全程遍历最小堆，寻找最早进入timer管理器的定时器，然后唤醒。他是怎么找到要唤醒哪个G的？回头看下`timeSleep`方法里把当时正在执行的G以及唤醒方法`goroutineReady`带到了每个定时器里，而在`timerproc`则通过找到期的定时器执行`f(arg, seq)`
 即通过`goroutineReady`方法唤醒。方法调用过程: `goroutineReady() -> ready()`
 
 ```
@@ -1404,8 +1816,3 @@ func recv(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
 
 3）如果即没有发送者，chan里也没数据就通过`goparkunlock`进行休眠，在休眠之前把当前的G相关信息存到`recvq`里面，以便有数据时找到要唤醒的G。
 
-### 网络IO
-
-### 系统调用
-
-### GC STW时调度都收到什么影响？
