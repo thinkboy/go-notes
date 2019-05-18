@@ -12,11 +12,11 @@
 
 * 1. [简单概念](#简单概念)
     * 1.1 [调度器的三个抽象概念：G、M、P](#调度器的三个抽象概念：G、M、P)
-    *  1.2 [调度的大致轮廓](#调度的大致轮廓)
+    * 1.2 [调度的大致轮廓](#调度的大致轮廓)
 * 2. [进程启动时都做了什么](#进程启动时都做了什么)
-    * 2.1 [`runtime.osinit(SB)`方法针对系统环境的初始化](#`runtime.osinit(SB)`方法针对系统环境的初始化)
-    * 2.2 [`runtime.schedinit(SB)`调度相关的一些初始化](#`runtime.schedinit(SB)`调度相关的一些初始化)
-    * 2.3 [`runtime·mainPC(SB)`启动监控任务](#`runtime·mainPC(SB)`启动监控任务)
+    * 2.1 [runtime.osinit(SB)方法针对系统环境的初始化](#runtime.osinit(SB)方法针对系统环境的初始化)
+    * 2.2 [runtime.schedinit(SB)调度相关的一些初始化](#runtime.schedinit(SB)调度相关的一些初始化)
+    * 2.3 [runtime·mainPC(SB)启动监控任务](#runtime·mainPC(SB)启动监控任务)
 * 3. [调度循环都做了什么](#调度循环都做了什么)
     * 3.1 [调度器如何开启调度循环](#调度器如何开启调度循环)
     * 3.2 [调度器如何进行调度循环](#调度器如何进行调度循环)
@@ -27,7 +27,7 @@
     * 4.3 [抢占让出CPU](#抢占让出CPU)
     * 4.4 [系统调用让出CPU](#系统调用让出CPU)
 * 5. [待执行G的来源](#待执行G的来源)
-    * 5.1 [`go func`创建G](#`go func`创建G)
+    * 5.1 [go func 创建G](#go func 创建G)
     * 5.2 [epoll来源](#epoll来源)
 * 6. [看几个主动让出CPU的场景](#看几个主动让出CPU的场景)
     * 6.1 [time.Sleep](#time.Sleep)
@@ -119,7 +119,7 @@ ok:
 
 我们按照顺序看是怎么完成上面三个事情的。
 
-### `runtime.osinit(SB)`方法针对系统环境的初始化
+### runtime.osinit(SB)方法针对系统环境的初始化
 
 这里实质只做了一件事情，就是获取CPU的线程数，也就是Top命令里看到的CPU0、CPU1、CPU2......的数量
 
@@ -161,7 +161,7 @@ if procresize(procs) != nil {
 
 > 有些人在进程初始化的时候经常用到`runtime.GOMAXPROCS()`方法，其实也是调用的`procresize`方法重新设置了最大CPU使用数量。
 
-### `runtime·mainPC(SB)`启动监控任务
+### runtime·mainPC(SB)启动监控任务
 ```
 // runtime/proc.go
 
@@ -179,7 +179,7 @@ func main() {
 ```
 在runtime下会启动一个全程运行的监控任务，该任务用于标记抢占执行过长时间的G，以及检测epoll里面是否有可执行的G。下面会详细说到。
 
-### 最后`runtime·mstart(SB)`启动调度循环
+### 最后runtime·mstart(SB)启动调度循环
 
 前面都是各种初始化操作，在这里开启了调度器的第一个调度循环。(这里启动的M就是M0)
 
@@ -1138,7 +1138,7 @@ func exitsyscall0(gp *g) {
 
 ## 待执行G的来源
 
-### `go func`创建G
+### go func 创建G
 
 当开启一个Goroutine的时候用到`go func()`这样的语法，在runtime下其实调用的就是`newproc`方法。
 
