@@ -1138,7 +1138,7 @@ func exitsyscall0(gp *g) {
 
 ## 待执行G的来源
 
-### go func 创建G
+### gofunc创建G
 
 当开启一个Goroutine的时候用到`go func()`这样的语法，在runtime下其实调用的就是`newproc`方法。
 
