@@ -1,5 +1,15 @@
 # schedtrace说明
 
+首先需要打开go的schedtrace功能，可通过环境变量GODEBUG="schedtrace=10000"，数值表示每次打印的毫秒数，例子就是10秒。
+
+启动命令如下:
+
+```
+$ GODEBUG=schedtrace=10000 ./main
+```
+
+schedtrace信息如下：
+
 ```
 SCHED 97151512ms: gomaxprocs=40 idleprocs=40 threads=82 spinningthreads=0 idlethreads=66 runqueue=0 [0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0]
 ```
