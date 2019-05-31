@@ -868,6 +868,31 @@ func (h *mheap) allocLarge(npage uintptr) *mspan {
 
 上面分析完内存分配，有分配自然就有释放，也就是我们的GC了。下面对Go的GC过程做下分析。
 
-先看下堆内存分配的过程图：
+在源码里有这么一段注释：
+
+```
+// runtime/mgc.go
+
+// The GC runs concurrently with mutator threads, is type accurate (aka precise), allows multiple
+// GC thread to run in parallel. It is a concurrent mark and sweep that uses a write barrier. It is
+// non-generational and non-compacting.
+```
+`GC`与`mutator`线程并行运行，允许GC线程并行的运行。它是一个使用写屏障的标记(mark)和清除(sweep)。它即不是**分代算法**也不是**标记-压缩(Mark-Compact)**算法。Go的GC采用的**标记-清除(Mark-Sweep)**算法。
+
+先看下GC的主要流程图：
 
 ![](images/heap6.png)
+
+GC被分为两大块逻辑：一块`标记`(绿色部分)、一块`清除`(灰色部分)。首先runtime启动的时候开启一个用于清扫的Goroutine，启动后不做任何操作进入休眠等待有清除的工作。然后启动标记工作任务进行并发标记，标记完成后唤醒负责清除任务的Goroutine，清除任务完成后再次休眠等待下一轮GC。
+
+> 注1：标记任务的启动有三个触发方式：1）内存分配时检测增长到达一定量时触发。2）强制2分钟触发(forcegchelper)。3）外部用户触发。
+
+> 注2：源码注释里有说sweep是并发的，为什么只开启了一个Goroutine？因为源码中所描述的sweep是并发的指的是`sweep方法`可以并发调用，也就是说纯做清除工作的方法是支持并发的，并不是可以开启多个`sweep过程`的Goroutine。
+
+下面分别从`标记过程`、`清理过程`、`如何与内存分配的关联`三个方向看实现。
+
+### 标记(Mark)过程
+
+### 清理(Sweep)过程
+
+### 如何与内存分配关联
