@@ -8,6 +8,25 @@
 
 -------------------------------------
 
+# 目录
+
+先来个目录方便读者理解文本结构
+
+* 1.[简单概念](#简单概念)
+    * 1.1 [内存结构](#内存结构)
+    * 1.2 [关键结构](#关键结构)
+* 2.[堆内存分配](#堆内存分配)
+	* 2.1 [分配小对象(Small-Object)](#分配小对象(Small-Object))
+	* 2.2 [小对象如何获取一个Object](#小对象如何获取一个Object)
+	* 2.3 [小对象如何获取一个mspan](#小对象如何获取一个mspan)
+	* 2.4 [分配大对象(Large-Object)](#分配大对象(Large-Object))
+* 3.[堆内存释放(GC)](#堆内存释放(GC))
+	* 3.1 [标记(Mark)过程-后台GC](#标记(Mark)过程-后台GC)
+	* 3.2 [标记(Mark)过程-辅助标记](#标记(Mark)过程-辅助标记)
+	* 3.3 [清理(Sweep)过程](#清理(Sweep)过程)
+	* 3.4 [内存返还给系统](#内存返还给系统)
+* 4.[分配对象与释放对象中的标记位用法](#分配对象与释放对象中的标记位用法)
+
 ## 简单概念
 
 Go的内存分配器最开始基于tcmalloc的逻辑实现，但是后续有了一些差异。
@@ -32,7 +51,7 @@ bitmap区域与arena区域的关系:
 
 bitmap区域和arena区域的映射关系是以arena_start地址处向相反方向映射的。
 
-### 关键结构体
+### 关键结构
 
 ```
 //	mheap: 堆分配, 以每个内存页大小(page size)8KB的粒度管理。
@@ -57,7 +76,7 @@ bitmap区域和arena区域的映射关系是以arena_start地址处向相反方�
 
 对象分配被区分了`小对象(Small Object)`、`大对象(Large Object)`两类。下面分别看下实现：
 
-### 分配小对象(Small Object)
+### 分配小对象(Small-Object)
 
 小对象分配中依赖了四个组件`mspan`、`mcache`、`mcentral`、`mheap`。0~32KB大小范围的对象，根据不同大小被划分为67个大小分类(size class)进行管理。
 
@@ -757,7 +776,7 @@ func sysMap(v unsafe.Pointer, n uintptr, reserved bool, sysStat *uint64) {
 
 >从系统分配内存有个大小条件，最少分配1MB，也就是128 page size，以免频繁进行系统调用。
 
-### 分配大对象(Large Object)
+### 分配大对象(Large-Object)
 
 与分配小对象不同的是，大对象只依赖了两个组件`mspan`、`mheap`，>32KB大小范围的对象。回到最开始的`mallocgc`方法。
 
