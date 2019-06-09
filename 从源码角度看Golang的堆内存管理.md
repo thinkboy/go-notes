@@ -714,7 +714,6 @@ func (h *mheap) grow(npage uintptr) bool {
 // runtime/malloc.go
 
 func (h *mheap) sysAlloc(n uintptr) unsafe.Pointer {
-
 	......
 
 	// 不超出arena大小限制
@@ -766,7 +765,6 @@ func sysMap(v unsafe.Pointer, n uintptr, reserved bool, sysStat *uint64) {
 // runtime/malloc.go
 
 func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
-
 	......
 	
 	// 小对象, maxSmallSize=32KB
@@ -912,7 +910,6 @@ GC的第一步先是要标记，Go用了一种叫**三色标记**的算法标记
 // runtime/proc.go
 
 func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
-
 	......
 
 	if shouldhelpgc {
@@ -1223,37 +1220,7 @@ func gcBgMarkWorker(_p_ *p) {
 			casgstatus(gp, _Gwaiting, _Grunning)
 		})
 
-		// If we are nearing the end of mark, dispose
-		// of the cache promptly. We must do this
-		// before signaling that we're no longer
-		// working so that other workers can't observe
-		// no workers and no work while we have this
-		// cached, and before we compute done.
-		if gcBlackenPromptly {
-			_p_.gcw.dispose()
-		}
-
-		// Account for time.
-		duration := nanotime() - startTime
-		switch _p_.gcMarkWorkerMode {
-		case gcMarkWorkerDedicatedMode:
-			atomic.Xaddint64(&gcController.dedicatedMarkTime, duration)
-			atomic.Xaddint64(&gcController.dedicatedMarkWorkersNeeded, 1) // 计数+1表示允许新增1个标记任务并行运行
-		case gcMarkWorkerFractionalMode:
-			atomic.Xaddint64(&gcController.fractionalMarkTime, duration)
-			atomic.Xaddint64(&gcController.fractionalMarkWorkersNeeded, 1)
-		case gcMarkWorkerIdleMode:
-			atomic.Xaddint64(&gcController.idleMarkTime, duration)
-		}
-
-		// Was this the last worker and did we run out
-		// of work?
-		incnwait := atomic.Xadd(&work.nwait, +1) // 每个标记任务完成后都+1
-		if incnwait > work.nproc {
-			println("runtime: p.gcMarkWorkerMode=", _p_.gcMarkWorkerMode,
-				"work.nwait=", incnwait, "work.nproc=", work.nproc)
-			throw("work.nwait > work.nproc")
-		}
+		......
 
 		// If this worker reached a background mark completion
 		// point, signal the main GC goroutine.
@@ -1311,7 +1278,9 @@ func (c *gcControllerState) findRunnableGCWorker(_p_ *p) *g {
 		// 记录当前P开始被用于专用标记工作，直到并发标记阶段结束
 		_p_.gcMarkWorkerMode = gcMarkWorkerDedicatedMode
 	} else {
+	
 		......
+		
 		_p_.gcMarkWorkerMode = gcMarkWorkerFractionalMode // 设置当前P可进行的标记模式：少量参与标记，其实就是只处理下P本地的
 	}
 
@@ -1702,7 +1671,6 @@ sweepSpans包含2个mspan：一个清理过的正在使用的spans，一个是�
 // 清理mspan自身，返还给mheap里的heap或者mcentral
 // 如果preserve=true,将不或返还给heap或者mcentral，就只是做清理及初始化操作
 func (s *mspan) sweep(preserve bool) bool {
-
 	......
 
 	// gcmarkBits becomes the allocBits.
@@ -1772,7 +1740,6 @@ func (h *mheap) freeSpan(s *mspan, acct int32) {
 
 // 把span返回给mheap
 func (h *mheap) freeSpanLocked(s *mspan, acctinuse, acctidle bool, unusedsince int64) {
-
 	......
 
 	// Coalesce with earlier, later spans.
@@ -1831,6 +1798,60 @@ func (h *mheap) freeList(npages uintptr) *mSpanList {
 }
 ```
 最终还是返还给`mheap.freelarge`或者`mheap.free`，在分配对象的过程有看到两个结构。
+
+### 内存返还给系统
+
+在上面看到只是mspan返还给了mheap结构，但mheap里也依然是进程占用内存，那么什么时候返还给系统的？
+
+在程序启动的时候有开启一个单独的监控Gouroutine，定时检测需要返还给系统。
+
+```
+// runtime/proc.go
+
+func sysmon() {
+	......
+	
+	for {
+		// scavenge heap once in a while
+		if lastscavenge+scavengelimit/2 < now { // 过2分30秒检查清理一下mheap里的空闲内存返回给系统。
+			mheap_.scavenge(int32(nscavenge), uint64(now), uint64(scavengelimit))
+			lastscavenge = now
+			nscavenge++
+		}
+		if debug.schedtrace > 0 && lasttrace+int64(debug.schedtrace)*1000000 <= now {
+			lasttrace = now
+			schedtrace(debug.scheddetail > 0)
+		}
+	}
+}
+```
+```
+// runtime/mheap.go
+
+// 检查清理mheap里的空闲内存返回给系统
+func (h *mheap) scavenge(k int32, now, limit uint64) {
+	......
+	
+	for i := 0; i < len(h.free); i++ {
+		sumreleased += scavengelist(&h.free[i], now, limit) // 检查free链表
+	}
+	sumreleased += scavengetreap(h.freelarge.treap, now, limit) // 检查freelarge链表
+	unlock(&h.lock)
+	gp.m.mallocing--
+}
+```
+在`scavengelist`、`scavengetreap`内都用到一个`sysUnused`方法
+
+```
+// runtime/mem_linux.go
+
+func sysUnused(v unsafe.Pointer, n uintptr) {
+	......
+
+	madvise(v, n, _MADV_DONTNEED)
+}
+```
+最终`madvise`释放内存。(该方法自行Google)。
 
 ## 分配对象与释放对象中的标记位用法
 
